@@ -1,0 +1,38 @@
+# Immich Booru Tagger 配置文件模板
+# 复制本文件为 config.toml 后按需修改（config.toml 已加入 .gitignore，避免密钥泄露）
+
+[immich]
+# Immich 服务地址，也可通过环境变量 IMMICH_BASE_URL 覆盖
+base_url = "http://127.0.0.1:2283"
+# Immich API Key，也可通过环境变量 IMMICH_API_KEY 覆盖
+api_key = "your-immich-api-key"
+# 拉取到内存推理的缩略图规格："preview"（高清预览图）或 "thumbnail"（小尺寸缩略图）
+thumbnail_size = "preview"
+# 单次 HTTP 请求超时时间（秒）
+timeout = 30.0
+
+[batch]
+# 微批次（Micro-batch）大小：每处理满该数量资产立即向 Immich 批量写回一次标签
+size = 20
+
+[pipeline.anime]
+# 二次元管线（anime_pixai）通用特征与角色标签置信度阈值（范围 0.0 ~ 1.0）
+general_threshold = 0.35
+character_threshold = 0.85
+
+[pipeline.real]
+# 三次元管线（real_idolsankaku）通用特征与人物角色标签置信度阈值（范围 0.0 ~ 1.0）
+general_threshold = 0.35
+character_threshold = 0.85
+
+# 目标相册列表（至少配置一项）
+# 每个相册必须且只能指定 id（UUID）或 name（相册名称）之一
+# mode 可选："auto"（自动域分流，默认）、"anime"（强制二次元）、"real"（强制三次元）
+
+[[albums]]
+name = "Mixed Album"
+mode = "auto"
+
+# [[albums]]
+# id = "00000000-0000-0000-0000-000000000000"
+# mode = "anime"
