@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar
 
 from PIL import Image
@@ -248,6 +250,49 @@ def _ensure_hf_token_env() -> None:
         os.environ["HF_TOKEN"] = token
 
 
+_DLL_DIR_HANDLES: list[object] = []
+
+
+def _preload_onnx_gpu_dlls() -> None:
+    """Expose bundled NVIDIA wheel bin dirs and preload CUDA/cuDNN DLLs when present."""
+    nvidia_root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    if nvidia_root.is_dir():
+        bin_dirs = [str(p) for p in nvidia_root.glob("*/bin") if p.is_dir()]
+        if bin_dirs:
+            current_path = os.environ.get("PATH", "")
+            existing = set(current_path.split(os.pathsep)) if current_path else set()
+            missing = [d for d in bin_dirs if d not in existing]
+            if missing:
+                os.environ["PATH"] = (
+                    os.pathsep.join(missing) + os.pathsep + current_path
+                    if current_path
+                    else os.pathsep.join(missing)
+                )
+            add_dll_directory = getattr(os, "add_dll_directory", None)
+            if callable(add_dll_directory):
+                for bin_dir in bin_dirs:
+                    try:
+                        _DLL_DIR_HANDLES.append(add_dll_directory(bin_dir))
+                    except OSError:
+                        pass
+
+    try:
+        import onnxruntime
+    except ImportError:
+        return
+    preload = getattr(onnxruntime, "preload_dlls", None)
+    if callable(preload):
+        try:
+            preload()
+        except Exception:
+            pass
+
+
+def _prepare_onnx_runtime() -> None:
+    _ensure_hf_token_env()
+    _preload_onnx_gpu_dlls()
+
+
 class ImgutilsAnimeBackend:
     """Lazy-loaded dghs-imgutils adapter implementing AnimeBackend."""
 
@@ -275,7 +320,7 @@ class ImgutilsAnimeBackend:
                 "install the 'cpu' or 'gpu' optional extra."
             ) from exc
 
-        _ensure_hf_token_env()
+        _prepare_onnx_runtime()
         rating_model = generic_module.MultiLabelTIMMModel(ANIME_RATING_REPO_ID)
         return cls(
             tagging_module=tagging_module,
@@ -346,6 +391,7 @@ class RealutilsRealBackend:
                 "install the 'cpu' or 'gpu' optional extra."
             ) from exc
 
+        _prepare_onnx_runtime()
         return cls(tagging_module=tagging_module)
 
     def extract_idolsankaku(
@@ -389,6 +435,7 @@ class ImgutilsDomainClassifier:
                 "install the 'cpu' or 'gpu' optional extra."
             ) from exc
 
+        _prepare_onnx_runtime()
         return cls(validate_module=validate_module)
 
     def classify_domain(self, image: Image.Image) -> tuple[str, float]:

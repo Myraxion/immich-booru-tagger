@@ -19,7 +19,11 @@ cpu = [
 gpu = [
     "dghs-imgutils",
     "dghs-realutils",
-    "onnxruntime-gpu",
+    "onnxruntime-gpu<1.25",
+    "nvidia-cudnn-cu12",
+    "nvidia-cublas-cu12<12.9",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cufft-cu12",
 ]
 
 [dependency-groups]
@@ -50,5 +54,5 @@ mypy_path = "src"
 packages = ["immich_booru_tagger"]
 
 [[tool.mypy.overrides]]
-module = ["imgutils", "imgutils.*", "realutils", "realutils.*"]
+module = ["imgutils", "imgutils.*", "realutils", "realutils.*", "onnxruntime", "onnxruntime.*"]
 ignore_missing_imports = true
