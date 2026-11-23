@@ -248,3 +248,58 @@ def test_load_config_fast_fails_on_invalid_schema(
 
     with pytest.raises(ConfigError):
         load_config(cfg_file, env={})
+
+
+def test_load_config_parses_album_artist_patterns(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        """
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "secret-key"
+
+[[albums]]
+name = "Pixiv"
+artist_patterns = ['^\\[(?P<artist>[^\\]]+)\\]', '^pixiv_\\d+_(.+)$']
+
+[[albums]]
+name = "Default"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(cfg_file, env={})
+
+    assert config.albums[0].artist_patterns == [
+        r"^\[(?P<artist>[^\]]+)\]",
+        r"^pixiv_\d+_(.+)$",
+    ]
+    assert config.albums[1].artist_patterns == []
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "[unclosed",
+        r"^pixiv_\d+_.*$",
+    ],
+)
+def test_load_config_rejects_invalid_or_groupless_artist_patterns(
+    tmp_path: Path, pattern: str
+) -> None:
+    cfg_file = tmp_path / "invalid_pattern.toml"
+    cfg_file.write_text(
+        f"""
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "secret-key"
+
+[[albums]]
+name = "Pixiv"
+artist_patterns = [{pattern!r}]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_file, env={})

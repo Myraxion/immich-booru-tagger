@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -79,6 +80,23 @@ class AlbumConfig(BaseModel):
     id: str | None = None
     name: str | None = None
     mode: RoutingMode = "auto"
+    artist_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("artist_patterns")
+    @classmethod
+    def _validate_artist_patterns(cls, patterns: list[str]) -> list[str]:
+        for idx, pattern in enumerate(patterns):
+            try:
+                compiled = re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"artist_patterns[{idx}] is not a valid regex ({pattern!r}): {exc}"
+                ) from exc
+            if compiled.groups < 1:
+                raise ValueError(
+                    f"artist_patterns[{idx}] must contain at least one capture group: {pattern!r}"
+                )
+        return patterns
 
     @model_validator(mode="after")
     def _validate_selector_exclusivity(self) -> AlbumConfig:

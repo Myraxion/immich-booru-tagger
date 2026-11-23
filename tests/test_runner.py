@@ -1107,3 +1107,85 @@ def test_auto_album_with_only_real_images_never_loads_anime_backend() -> None:
     assert anime_loads == 0
     assert real_loads == 1
     assert summary.results[0].tags == ["general/solo", "rating/safe"]
+
+
+def test_batch_runner_extracts_artist_tag_from_album_patterns_and_persists_to_immich() -> None:
+    created_tags: list[str] = []
+    tagged_assets: dict[str, list[str]] = {}
+    tag_ids: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/alb-pixiv":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-pixiv",
+                    "albumName": "Pixiv",
+                    "assets": [
+                        {
+                            "id": "a-1",
+                            "type": "IMAGE",
+                            "originalFileName": "[Mika Pikazo] art_01.png",
+                            "exifInfo": None,
+                            "tags": [],
+                        },
+                        {
+                            "id": "a-2",
+                            "type": "IMAGE",
+                            "originalFileName": "pixiv_999_wlop.jpg",
+                            "exifInfo": None,
+                            "tags": [],
+                        },
+                        {
+                            "id": "a-3",
+                            "type": "IMAGE",
+                            "originalFileName": "unmatched.png",
+                            "exifInfo": None,
+                            "tags": [],
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/thumbnail"):
+            return httpx.Response(200, content=_png_bytes(2, 2))
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            response_items = []
+            for value in body["tags"]:
+                created_tags.append(value)
+                tag_id = tag_ids.setdefault(value, f"tid-{len(tag_ids) + 1}")
+                response_items.append({"id": tag_id, "value": value})
+            return _json_response(200, response_items)
+        if request.method == "PUT" and request.url.path.startswith("/api/tags/") and request.url.path.endswith("/assets"):
+            tag_id = request.url.path.split("/")[3]
+            body = json.loads(request.content.decode("utf-8"))
+            tagged_assets.setdefault(tag_id, []).extend(body["ids"])
+            return httpx.Response(204)
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        albums=[
+            AlbumConfig(
+                id="alb-pixiv",
+                mode="anime",
+                artist_patterns=[
+                    r"^\[(?P<artist>[^\]]+)\]",
+                    r"^pixiv_\d+_(.+)$",
+                ],
+            )
+        ],
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        summary = BatchRunner(config=config, client=client).run()
+
+    assert [r.tags for r in summary.results] == [
+        ["artist/mika_pikazo"],
+        ["artist/wlop"],
+        [],
+    ]
+    assert set(created_tags) == {"artist/mika_pikazo", "artist/wlop", "meta/booru_tagged"}
+    assert tagged_assets[tag_ids["artist/mika_pikazo"]] == ["a-1"]
+    assert tagged_assets[tag_ids["artist/wlop"]] == ["a-2"]
+    assert tagged_assets[tag_ids["meta/booru_tagged"]] == ["a-1", "a-2", "a-3"]

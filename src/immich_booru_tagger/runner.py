@@ -21,6 +21,7 @@ from immich_booru_tagger.pipeline import VisionPipeline
 from immich_booru_tagger.rules import (
     PROCESSED_MARKER,
     compute_dimension_meta_tags,
+    extract_artist_tag,
     normalize_booru_tag,
 )
 from immich_booru_tagger.timefilter import validate_time_range
@@ -116,7 +117,7 @@ class BatchRunner:
                     skipped_count += 1
                     continue
                 try:
-                    tags = self._compute_asset_tags(asset, image, album.mode)
+                    tags = self._compute_asset_tags(asset, image, album)
                 finally:
                     image.close()
 
@@ -194,14 +195,18 @@ class BatchRunner:
             return None
 
     def _compute_asset_tags(
-        self, asset: ImmichAsset, image: Image.Image, mode: RoutingMode
+        self, asset: ImmichAsset, image: Image.Image, album: TargetAlbum
     ) -> list[str]:
         raw_tags: list[str] = []
         if self._vision_pipeline is not None:
-            for category, tag_name in self._vision_pipeline.predict(image, mode):
+            for category, tag_name in self._vision_pipeline.predict(image, album.mode):
                 raw_tags.append(normalize_booru_tag(category, tag_name))
 
         raw_tags.extend(compute_dimension_meta_tags(asset.width, asset.height))
+        if artist_tag := extract_artist_tag(
+            asset.original_file_name, album.artist_patterns
+        ):
+            raw_tags.append(artist_tag)
         return list(dict.fromkeys(raw_tags))
 
     @staticmethod

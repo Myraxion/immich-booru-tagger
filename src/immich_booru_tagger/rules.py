@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Sequence
 
 MANAGED_CATEGORIES: tuple[str, ...] = (
     "rating",
@@ -56,3 +58,39 @@ def compute_dimension_meta_tags(width: int | None, height: int | None) -> list[s
         tags.append("meta/wide_image")
 
     return tags
+
+
+def extract_artist_tag(
+    file_name: str,
+    patterns: Sequence[str | re.Pattern[str]],
+) -> str | None:
+    """Extract and normalize the first matching artist tag from an asset filename stem."""
+    if not file_name or not patterns:
+        return None
+
+    stem = os.path.splitext(file_name)[0]
+    if not stem:
+        return None
+
+    for pattern in patterns:
+        compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+        match = compiled.search(stem)
+        if match is None:
+            continue
+
+        if "artist" in compiled.groupindex:
+            raw_artist = match.group("artist")
+        elif compiled.groups >= 1:
+            raw_artist = match.group(1)
+        else:
+            continue
+
+        if raw_artist is None:
+            continue
+
+        try:
+            return normalize_booru_tag("artist", raw_artist)
+        except ValueError:
+            continue
+
+    return None

@@ -88,6 +88,10 @@ character_threshold = 0.85
 [[albums]]
 name = "Mixed Album"              # 每个相册必须且只能指定 name 或 id（UUID）之一
 mode = "auto"                     # "auto" | "anime" | "real"
+# artist_patterns = [             # 可选：按顺序从文件名（不含扩展名）提取 artist/* 标签，命中第一条有效规则即止
+#   '^\[(?P<artist>[^\]]+)\]',    # 优先读取 (?P<artist>...) 命名捕获组，否则取第 1 个捕获组
+#   '^pixiv_\d+_(.+)$',
+# ]
 ```
 
 - 若希望避免在文件中保存明文密钥，可通过环境变量覆盖：
@@ -133,7 +137,7 @@ uv run --extra gpu immich-booru-tagger --config config.toml --force
   - `character/*`：角色 / 人物名称
   - `general/*`：通用画面特征
   - `meta/*`：媒介形式、完成度、原图尺寸属性及幂等标记 `meta/booru_tagged`
-  - `artist/*`：画师 / 作者命名空间（预留）
+  - `artist/*`：画师 / 作者命名空间（通过相册 `artist_patterns` 正则从文件名提取）
 - **原图尺寸与比例规则（`meta/*`）**：
   - 分辨率互斥分档：
     - `meta/absurdres`：原图宽 `>= 3200` 或高 `>= 2400`

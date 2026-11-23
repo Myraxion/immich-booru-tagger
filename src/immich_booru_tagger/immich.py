@@ -121,6 +121,7 @@ class TargetAlbum(BaseModel):
     id: str
     name: str
     mode: RoutingMode
+    artist_patterns: list[str] = Field(default_factory=list)
     assets: list[ImmichAsset]
 
 
@@ -250,6 +251,7 @@ class ImmichClient:
                     id=detail.id,
                     name=detail.album_name,
                     mode=album_cfg.mode,
+                    artist_patterns=album_cfg.artist_patterns,
                     assets=enriched_assets,
                 )
             )

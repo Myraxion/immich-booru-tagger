@@ -36,3 +36,6 @@ mode = "auto"
 # [[albums]]
 # id = "00000000-0000-0000-0000-000000000000"
 # mode = "anime"
+# # 可选：按顺序从去掉扩展名的文件名（stem）中提取 artist/<tag_name>，命中第一条有效规则即止
+# # 优先取命名捕获组 (?P<artist>...)，否则取第 1 个捕获组
+# artist_patterns = ['^\\[(?P<artist>[^\\]]+)\\]', '^pixiv_\\d+_(.+)$']

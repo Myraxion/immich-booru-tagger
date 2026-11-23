@@ -6,6 +6,7 @@ from immich_booru_tagger.rules import (
     MANAGED_CATEGORIES,
     PROCESSED_MARKER,
     compute_dimension_meta_tags,
+    extract_artist_tag,
     is_managed_tag,
     normalize_booru_tag,
 )
@@ -115,3 +116,50 @@ def test_compute_dimension_meta_tags_boundary_cases(
     width: int | None, height: int | None, expected: list[str]
 ) -> None:
     assert compute_dimension_meta_tags(width, height) == expected
+
+
+@pytest.mark.parametrize(
+    ("file_name", "patterns", "expected"),
+    [
+        # Strip only the final extension (match against stem)
+        ("pixiv_12345_wlop.jpg", [r"^pixiv_\d+_(.+)$"], "artist/wlop"),
+        ("[Artist Name] art.v2.png", [r"^\[(.+?)\]"], "artist/artist_name"),
+        # Prefer named (?P<artist>...) group over positional group(1)
+        (
+            "2026_Mika Pikazo_123.png",
+            [r"^(\d+)_(?P<artist>.+)_\d+$"],
+            "artist/mika_pikazo",
+        ),
+        # First valid match wins in order
+        (
+            "[foo] pixiv_123_bar.webp",
+            [r"^\[([^\]]+)\]", r"^pixiv_\d+_(.+)$"],
+            "artist/foo",
+        ),
+        # Skip rule when captured group is None or empty after Booru normalization, continue to next
+        (
+            "[_ / _]_by_reimu.png",
+            [r"^\[(?P<artist>[^\]]+)\]", r"_by_(.+)$"],
+            "artist/reimu",
+        ),
+        (
+            "optional_prefix_by_marisa.png",
+            [r"^optional_(?:(missing)_)?prefix", r"_by_(.+)$"],
+            "artist/marisa",
+        ),
+        # Booru normalization (spaces/slashes -> _, preserve () and :)
+        (
+            "Artist (Pixiv) / Alt.jpeg",
+            [r"^(.+)$"],
+            "artist/artist_(pixiv)_alt",
+        ),
+        # No match / empty inputs
+        ("random_photo.jpg", [r"^pixiv_(.+)$"], None),
+        ("random_photo.jpg", [], None),
+        ("", [r"^(.+)$"], None),
+    ],
+)
+def test_extract_artist_tag_extracts_and_normalizes_first_match(
+    file_name: str, patterns: list[str], expected: str | None
+) -> None:
+    assert extract_artist_tag(file_name, patterns) == expected
