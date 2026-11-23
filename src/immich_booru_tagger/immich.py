@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any
 
@@ -11,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from immich_booru_tagger.config import AlbumConfig, AppConfig, RoutingMode, ThumbnailSize
 from immich_booru_tagger.rules import PROCESSED_MARKER, is_managed_tag
+from immich_booru_tagger.timefilter import ensure_aware
 
 
 class ImmichError(RuntimeError):
@@ -66,6 +68,7 @@ class ImmichAsset(BaseModel):
     id: str
     type: str
     original_file_name: str = Field(default="", alias="originalFileName")
+    created_at: datetime | None = Field(default=None, alias="createdAt")
     exif_info: ExifInfo | None = Field(default=None, alias="exifInfo")
     tags: list[ImmichTag] = Field(default_factory=list)
     tags_present: bool = Field(default=False, exclude=True)
@@ -127,6 +130,27 @@ def _append_unique(mapping: dict[str, list[str]], key: str, value: str) -> None:
         bucket.append(value)
 
 
+def _to_utc_iso(dt: datetime) -> str:
+    return ensure_aware(dt).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _within_created_at_range(
+    asset: ImmichAsset,
+    created_after: datetime | None,
+    created_before: datetime | None,
+) -> bool:
+    if created_after is None and created_before is None:
+        return True
+    if asset.created_at is None:
+        return False
+    asset_ts = ensure_aware(asset.created_at, default_tz=timezone.utc)
+    if created_after is not None and asset_ts < ensure_aware(created_after):
+        return False
+    if created_before is not None and asset_ts > ensure_aware(created_before):
+        return False
+    return True
+
+
 class ImmichClient:
     """Synchronous HTTP client wrapper for Immich REST APIs."""
 
@@ -183,7 +207,13 @@ class ImmichClient:
         if self._owns_client:
             self._client.close()
 
-    def resolve_target_albums(self, album_configs: Sequence[AlbumConfig]) -> list[TargetAlbum]:
+    def resolve_target_albums(
+        self,
+        album_configs: Sequence[AlbumConfig],
+        *,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> list[TargetAlbum]:
         """Resolve all configured Target Albums into concrete TargetAlbum objects."""
         all_albums: list[_AlbumSummaryPayload] | None = None
         resolved: list[TargetAlbum] = []
@@ -201,10 +231,19 @@ class ImmichClient:
             raw_assets = (
                 detail.assets
                 if detail.assets or detail.asset_count == 0
-                else self._search_album_assets(album_id)
+                else self._search_album_assets(
+                    album_id,
+                    created_after=created_after,
+                    created_before=created_before,
+                )
             )
+            filtered_assets = [
+                asset
+                for asset in raw_assets
+                if _within_created_at_range(asset, created_after, created_before)
+            ]
             enriched_assets = [
-                self._enrich_asset_tags_if_missing(asset) for asset in raw_assets
+                self._enrich_asset_tags_if_missing(asset) for asset in filtered_assets
             ]
             resolved.append(
                 TargetAlbum(
@@ -217,19 +256,31 @@ class ImmichClient:
 
         return resolved
 
-    def _search_album_assets(self, album_id: str) -> list[ImmichAsset]:
+    def _search_album_assets(
+        self,
+        album_id: str,
+        *,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> list[ImmichAsset]:
         assets: list[ImmichAsset] = []
         page = 1
         while True:
+            search_body: dict[str, Any] = {
+                "albumIds": [album_id],
+                "page": page,
+                "size": 250,
+                "withExif": True,
+            }
+            if created_after is not None:
+                search_body["createdAfter"] = _to_utc_iso(created_after)
+            if created_before is not None:
+                search_body["createdBefore"] = _to_utc_iso(created_before)
+
             payload = self._request_json(
                 "POST",
                 "/api/search/metadata",
-                json={
-                    "albumIds": [album_id],
-                    "page": page,
-                    "size": 250,
-                    "withExif": True,
-                },
+                json=search_body,
             )
             if not isinstance(payload, dict):
                 raise ImmichApiError("Expected JSON object from POST /api/search/metadata")

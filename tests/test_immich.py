@@ -1,6 +1,7 @@
 """Tests for ImmichClient album resolution and asset parsing via httpx.MockTransport."""
 
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -438,3 +439,123 @@ def test_fetch_asset_thumbnail_raises_immich_api_error_on_http_or_transport_fail
         with pytest.raises(ImmichApiError) as exc_info2:
             client.fetch_asset_thumbnail("asset-1")
     assert exc_info2.value.status_code is None
+
+
+def test_resolve_target_album_filters_by_created_at_before_fetching_asset_details() -> None:
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.method == "GET" and request.url.path == "/api/albums/album-v2":
+            return _json_response(
+                200,
+                {
+                    "id": "album-v2",
+                    "albumName": "TimeFiltered",
+                    "assets": [
+                        {
+                            "id": "a-old",
+                            "type": "IMAGE",
+                            "originalFileName": "old.png",
+                            "createdAt": "2025-01-01T00:00:00Z",
+                        },
+                        {
+                            "id": "a-in-1",
+                            "type": "IMAGE",
+                            "originalFileName": "in.png",
+                            "createdAt": "2026-06-01T12:00:00Z",
+                        },
+                        {
+                            "id": "a-new",
+                            "type": "IMAGE",
+                            "originalFileName": "new.png",
+                            "createdAt": "2026-12-01T00:00:00Z",
+                        },
+                        {
+                            "id": "a-missing-ts",
+                            "type": "IMAGE",
+                            "originalFileName": "missing_ts.png",
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/a-in-1":
+            return _json_response(
+                200,
+                {
+                    "id": "a-in-1",
+                    "type": "IMAGE",
+                    "originalFileName": "in.png",
+                    "tags": [],
+                },
+            )
+        return _json_response(404, {"message": "Should not fetch out-of-range asset"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        albums = client.resolve_target_albums(
+            [AlbumConfig(id="album-v2")],
+            created_after=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            created_before=datetime(2026, 11, 1, tzinfo=timezone.utc),
+        )
+
+    assert seen_paths == ["/api/albums/album-v2", "/api/assets/a-in-1"]
+    assert [asset.id for asset in albums[0].assets] == ["a-in-1"]
+
+
+def test_resolve_target_album_passes_time_bounds_to_metadata_search_fallback() -> None:
+    seen_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-v3":
+            return _json_response(
+                200,
+                {
+                    "id": "album-v3",
+                    "albumName": "SearchAlbum",
+                    "assetCount": 1,
+                },
+            )
+        if request.method == "POST" and request.url.path == "/api/search/metadata":
+            body = json.loads(request.content.decode("utf-8"))
+            seen_bodies.append(body)
+            return _json_response(
+                200,
+                {
+                    "assets": {
+                        "items": [
+                            {
+                                "id": "a-1",
+                                "type": "IMAGE",
+                                "originalFileName": "p1.png",
+                                "createdAt": "2026-06-01T12:00:00Z",
+                                "tags": [],
+                            }
+                        ],
+                        "nextPage": None,
+                    }
+                },
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    after = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    before = datetime(2026, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        albums = client.resolve_target_albums(
+            [AlbumConfig(id="album-v3")],
+            created_after=after,
+            created_before=before,
+        )
+
+    assert len(seen_bodies) == 1
+    assert seen_bodies[0]["createdAfter"] == "2026-01-01T00:00:00Z"
+    assert seen_bodies[0]["createdBefore"] == "2026-11-01T00:00:00Z"
+    assert [asset.id for asset in albums[0].assets] == ["a-1"]

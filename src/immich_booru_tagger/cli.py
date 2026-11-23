@@ -6,6 +6,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 
 import httpx
 
@@ -17,6 +18,7 @@ from immich_booru_tagger.pipeline import (
     VisionPipeline,
 )
 from immich_booru_tagger.runner import BatchRunner, RunSummary
+from immich_booru_tagger.timefilter import parse_time_bound, validate_time_range
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Re-tag assets even if they already carry meta/booru_tagged",
+    )
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="Only process assets createdAt >= TIME (e.g. 7d, 2mo, 1y, 2026-01-01)",
+    )
+    parser.add_argument(
+        "--until",
+        default=None,
+        help="Only process assets createdAt <= TIME (e.g. 1d, 2026-12-31)",
     )
     return parser
 
@@ -81,6 +93,19 @@ def main(
     args = build_parser().parse_args(argv)
 
     try:
+        now = datetime.now().astimezone()
+        created_after = (
+            parse_time_bound(args.since, now=now, end_of_day=False)
+            if args.since is not None
+            else None
+        )
+        created_before = (
+            parse_time_bound(args.until, now=now, end_of_day=True)
+            if args.until is not None
+            else None
+        )
+        validate_time_range(created_after, created_before)
+
         config = load_config(args.config)
         active_pipeline: VisionPipeline = (
             vision_pipeline
@@ -97,6 +122,8 @@ def main(
                 dry_run=args.dry_run,
                 limit=args.limit,
                 force=args.force,
+                created_after=created_after,
+                created_before=created_before,
             )
     except (ConfigError, ImmichError, PipelineError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

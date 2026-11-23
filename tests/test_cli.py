@@ -565,3 +565,114 @@ id = "alb-auto"
     assert "character/hatsune_miku" in out
     assert "rating/general" in out
     assert "meta/absurdres" in out
+
+
+def test_cli_since_and_until_filters_assets_before_detail_lookup(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg_file = tmp_path / "time.toml"
+    cfg_file.write_text(
+        """
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "k"
+
+[[albums]]
+id = "alb-time"
+mode = "anime"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == "/api/albums/alb-time":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-time",
+                    "albumName": "Time Album",
+                    "assets": [
+                        {
+                            "id": "a-old",
+                            "type": "IMAGE",
+                            "originalFileName": "old.png",
+                            "createdAt": "2026-05-31T12:00:00Z",
+                            "exifInfo": {"exifImageWidth": 1920, "exifImageHeight": 1080},
+                        },
+                        {
+                            "id": "a-mid",
+                            "type": "IMAGE",
+                            "originalFileName": "mid.png",
+                            "createdAt": "2026-06-15T12:00:00Z",
+                            "exifInfo": {"exifImageWidth": 1920, "exifImageHeight": 1080},
+                        },
+                        {
+                            "id": "a-new",
+                            "type": "IMAGE",
+                            "originalFileName": "future.png",
+                            "createdAt": "2026-07-02T12:00:00Z",
+                            "exifInfo": {"exifImageWidth": 1920, "exifImageHeight": 1080},
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/api/assets/a-mid":
+            return _json_response(
+                200,
+                {
+                    "id": "a-mid",
+                    "type": "IMAGE",
+                    "originalFileName": "mid.png",
+                    "tags": [],
+                },
+            )
+        if request.url.path == "/api/assets/a-mid/thumbnail":
+            return httpx.Response(status_code=200, content=_png_bytes())
+        return _json_response(404, {"message": "Unexpected request"})
+
+    exit_code = main(
+        ["-c", str(cfg_file), "--dry-run", "--since", "2026-06-01", "--until", "2026-06-30"],
+        transport=httpx.MockTransport(handler),
+        vision_pipeline=_NoopVisionPipeline(),
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert seen_paths == [
+        "/api/albums/alb-time",
+        "/api/assets/a-mid",
+        "/api/assets/a-mid/thumbnail",
+    ]
+    assert "mid.png" in captured.out
+    assert "old.png" not in captured.out
+    assert "future.png" not in captured.out
+
+
+def test_cli_returns_nonzero_when_since_is_after_until(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg_file = tmp_path / "time.toml"
+    cfg_file.write_text(
+        """
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "k"
+
+[[albums]]
+id = "alb-time"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        ["-c", str(cfg_file), "--dry-run", "--since", "2026-06-30", "--until", "2026-06-01"],
+    )
+
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert "--since" in err and "--until" in err

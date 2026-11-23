@@ -6,6 +6,7 @@ import io
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from PIL import Image, UnidentifiedImageError
 
@@ -22,6 +23,7 @@ from immich_booru_tagger.rules import (
     compute_dimension_meta_tags,
     normalize_booru_tag,
 )
+from immich_booru_tagger.timefilter import validate_time_range
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +74,19 @@ class BatchRunner:
         dry_run: bool = False,
         limit: int | None = None,
         force: bool = False,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
     ) -> RunSummary:
         """Execute one batch tagging pass across configured Target Albums."""
         if limit is not None and limit <= 0:
             raise ValueError(f"limit must be a positive integer, got {limit}")
+        validate_time_range(created_after, created_before)
 
-        resolved_albums = self._client.resolve_target_albums(self._config.albums)
+        resolved_albums = self._client.resolve_target_albums(
+            self._config.albums,
+            created_after=created_after,
+            created_before=created_before,
+        )
         total_scanned, eligible_pairs = self._collect_eligible_assets(
             resolved_albums, force=force
         )
