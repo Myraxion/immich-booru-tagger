@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from types import TracebackType
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from immich_booru_tagger.config import AlbumConfig, AppConfig, RoutingMode
+from immich_booru_tagger.config import AlbumConfig, AppConfig, RoutingMode, ThumbnailSize
 from immich_booru_tagger.rules import PROCESSED_MARKER, is_managed_tag
 
 
@@ -200,6 +200,15 @@ class ImmichClient:
 
         return resolved
 
+    def fetch_asset_thumbnail(
+        self, asset_id: str, size: ThumbnailSize = "preview"
+    ) -> bytes:
+        """Fetch raw thumbnail bytes for a single Immich asset."""
+        response = self._send_request(
+            "GET", f"/api/assets/{asset_id}/thumbnail", params={"size": size}
+        )
+        return response.content
+
     def ensure_tags(self, tag_values: Sequence[str]) -> dict[str, str]:
         """Upsert any unknown tags in Immich and return value -> id mapping."""
         unique_values = list(dict.fromkeys(tag_values))
@@ -314,9 +323,16 @@ class ImmichClient:
             )
         return matches[0].id
 
-    def _request_json(self, method: str, path: str, *, json: Any = None) -> Any:
+    def _send_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: Mapping[str, str] | None = None,
+    ) -> httpx.Response:
         try:
-            response = self._client.request(method, path, json=json)
+            response = self._client.request(method, path, json=json, params=params)
         except httpx.HTTPError as exc:
             raise ImmichApiError(f"Immich request {method} {path} failed: {exc}") from exc
 
@@ -325,6 +341,11 @@ class ImmichClient:
                 f"Immich API error {response.status_code} on {method} {path}: {response.text}",
                 status_code=response.status_code,
             )
+
+        return response
+
+    def _request_json(self, method: str, path: str, *, json: Any = None) -> Any:
+        response = self._send_request(method, path, json=json)
 
         if response.status_code == 204 or not response.content:
             return None

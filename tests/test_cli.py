@@ -1,12 +1,32 @@
 """End-to-end CLI tests driving cli.main with real TOML files and httpx.MockTransport."""
 
+import io
 import json
+import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import ModuleType
 
 import httpx
 import pytest
+from PIL import Image
 
 from immich_booru_tagger.cli import main
+from immich_booru_tagger.config import RoutingMode
+from immich_booru_tagger.pipeline import clear_shared_anime_backend_cache
+
+
+class _NoopVisionPipeline:
+    def predict(
+        self, image: Image.Image, mode: RoutingMode
+    ) -> Sequence[tuple[str, str]]:
+        return ()
+
+
+def _png_bytes() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(0, 128, 255)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _json_response(status_code: int, payload: object) -> httpx.Response:
@@ -78,11 +98,14 @@ mode = "anime"
                     ],
                 },
             )
+        if request.url.path.endswith("/thumbnail"):
+            return httpx.Response(status_code=200, content=_png_bytes())
         return _json_response(404, {"message": "Not found"})
 
     exit_code = main(
         ["--config", str(cfg_file), "--dry-run", "--limit", "1"],
         transport=httpx.MockTransport(handler),
+        vision_pipeline=_NoopVisionPipeline(),
     )
 
     captured = capsys.readouterr()
@@ -130,11 +153,14 @@ id = "alb-1"
                     ],
                 },
             )
+        if request.url.path.endswith("/thumbnail"):
+            return httpx.Response(status_code=200, content=_png_bytes())
         return _json_response(404, {})
 
     exit_code = main(
         ["-c", str(cfg_file), "--dry-run", "--force"],
         transport=httpx.MockTransport(handler),
+        vision_pipeline=_NoopVisionPipeline(),
     )
 
     captured = capsys.readouterr()
@@ -234,6 +260,9 @@ mode = "anime"
                 },
             )
 
+        if request.url.path.endswith("/thumbnail"):
+            return httpx.Response(status_code=200, content=_png_bytes())
+
         body = json.loads(request.content.decode("utf-8")) if request.content else None
         write_events.append((request.method, request.url.path, body))
 
@@ -250,6 +279,7 @@ mode = "anime"
     exit_code = main(
         ["-c", str(cfg_file), "--force"],
         transport=httpx.MockTransport(handler),
+        vision_pipeline=_NoopVisionPipeline(),
     )
 
     out = capsys.readouterr().out
@@ -262,3 +292,151 @@ mode = "anime"
         ("PUT", "/api/tags/new-0/assets", {"ids": ["a-1"]}),
         ("PUT", "/api/tags/new-1/assets", {"ids": ["a-1"]}),
     ]
+
+
+def test_cli_uses_default_vision_pipeline_for_anime_album(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clear_shared_anime_backend_cache()
+    cfg_file = tmp_path / "anime.toml"
+    cfg_file.write_text(
+        """
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "k"
+
+[[albums]]
+id = "alb-anime"
+mode = "anime"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class FakeTIMM:
+        def __init__(self, repo_id: str) -> None:
+            self.repo_id = repo_id
+
+        def predict(
+            self,
+            image: Image.Image,
+            *,
+            thresholds: float = 0.0,
+            use_tag_thresholds: bool = False,
+            fmt: tuple[str, ...] = ("rating",),
+        ) -> Mapping[str, float]:
+            return {"general": 0.9, "sensitive": 0.05, "questionable": 0.03, "explicit": 0.02}
+
+    imgutils_mod = ModuleType("imgutils")
+    tagging_mod = ModuleType("imgutils.tagging")
+    tagging_mod.get_pixai_tags = (  # type: ignore[attr-defined]
+        lambda image, **kwargs: ({"1girl": 0.95}, {"hatsune_miku": 0.92}, ["vocaloid"])
+    )
+    validate_mod = ModuleType("imgutils.validate")
+    validate_mod.anime_classify = lambda image, **kwargs: ("illustration", 0.97)  # type: ignore[attr-defined]
+    validate_mod.anime_completeness = lambda image, **kwargs: ("polished", 0.96)  # type: ignore[attr-defined]
+    generic_mod = ModuleType("imgutils.generic")
+    generic_mod.MultiLabelTIMMModel = FakeTIMM  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "imgutils", imgutils_mod)
+    monkeypatch.setitem(sys.modules, "imgutils.tagging", tagging_mod)
+    monkeypatch.setitem(sys.modules, "imgutils.validate", validate_mod)
+    monkeypatch.setitem(sys.modules, "imgutils.generic", generic_mod)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/albums/alb-anime":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-anime",
+                    "albumName": "Anime",
+                    "assets": [
+                        {
+                            "id": "a-1",
+                            "type": "IMAGE",
+                            "originalFileName": "miku.png",
+                            "exifInfo": {"exifImageWidth": 1920, "exifImageHeight": 1080},
+                            "tags": [],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/api/assets/a-1/thumbnail":
+            return httpx.Response(status_code=200, content=_png_bytes())
+        return _json_response(404, {})
+
+    try:
+        exit_code = main(
+            ["-c", str(cfg_file), "--dry-run"],
+            transport=httpx.MockTransport(handler),
+        )
+    finally:
+        clear_shared_anime_backend_cache()
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "general/1girl" in out
+    assert "character/hatsune_miku" in out
+    assert "copyright/vocaloid" in out
+    assert "rating/general" in out
+    assert "meta/illustration" in out
+    assert "meta/polished" in out
+    assert "meta/highres" in out
+
+
+def test_cli_returns_nonzero_when_default_vision_dependency_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clear_shared_anime_backend_cache()
+    cfg_file = tmp_path / "anime.toml"
+    cfg_file.write_text(
+        """
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "k"
+
+[[albums]]
+id = "alb-anime"
+mode = "anime"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setitem(sys.modules, "imgutils", None)
+    monkeypatch.setitem(sys.modules, "imgutils.tagging", None)
+    monkeypatch.setitem(sys.modules, "imgutils.validate", None)
+    monkeypatch.setitem(sys.modules, "imgutils.generic", None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/albums/alb-anime":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-anime",
+                    "albumName": "Anime",
+                    "assets": [
+                        {
+                            "id": "a-1",
+                            "type": "IMAGE",
+                            "originalFileName": "miku.png",
+                            "exifInfo": None,
+                            "tags": [],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/api/assets/a-1/thumbnail":
+            return httpx.Response(status_code=200, content=_png_bytes())
+        return _json_response(404, {})
+
+    exit_code = main(
+        ["-c", str(cfg_file), "--dry-run"],
+        transport=httpx.MockTransport(handler),
+    )
+
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert "dghs-imgutils" in err

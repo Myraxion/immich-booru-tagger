@@ -1,14 +1,32 @@
 """End-to-end tests for BatchRunner through ImmichClient + httpx.MockTransport."""
 
+import io
 import json
-from collections.abc import Sequence
+import logging
+from collections.abc import Mapping, Sequence
 
 import httpx
 import pytest
+from PIL import Image
 
-from immich_booru_tagger.config import AlbumConfig, AppConfig, BatchConfig, ImmichConfig, RoutingMode
-from immich_booru_tagger.immich import ImmichApiError, ImmichAsset, ImmichClient
+from immich_booru_tagger.config import (
+    AlbumConfig,
+    AppConfig,
+    BatchConfig,
+    ImmichConfig,
+    PipelinesConfig,
+    PipelineThresholdConfig,
+    RoutingMode,
+)
+from immich_booru_tagger.immich import ImmichApiError, ImmichClient
+from immich_booru_tagger.pipeline import DefaultVisionPipeline
 from immich_booru_tagger.runner import BatchRunner
+
+
+def _png_bytes(width: int = 1, height: int = 1, color: tuple[int, int, int] = (10, 20, 30)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), color=color).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _json_response(status_code: int, payload: object) -> httpx.Response:
@@ -100,6 +118,13 @@ def _sample_transport(requests_log: list[httpx.Request]) -> httpx.MockTransport:
                     ],
                 },
             )
+        if request.method == "GET" and request.url.path.startswith("/api/assets/") and request.url.path.endswith("/thumbnail"):
+            size = (2, 2) if "/img-3/" in request.url.path else (1, 1)
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "image/png"},
+                content=_png_bytes(*size),
+            )
         return _json_response(404, {"message": "Not found"})
 
     return httpx.MockTransport(handler)
@@ -151,7 +176,7 @@ def test_batch_runner_applies_limit_and_force_flags() -> None:
 def test_batch_runner_merges_and_normalizes_vision_pipeline_tags_with_dedup() -> None:
     class FakeVisionPipeline:
         def predict(
-            self, asset: ImmichAsset, mode: RoutingMode
+            self, image: Image.Image, mode: RoutingMode
         ) -> Sequence[tuple[str, str]]:
             return [
                 ("copyright", "Fate/Grand Order"),
@@ -201,9 +226,9 @@ def test_batch_runner_rejects_non_positive_limit() -> None:
 def test_batch_runner_writes_back_per_micro_batch_reusing_tag_cache() -> None:
     class FakeVisionPipeline:
         def predict(
-            self, asset: ImmichAsset, mode: RoutingMode
+            self, image: Image.Image, mode: RoutingMode
         ) -> Sequence[tuple[str, str]]:
-            if asset.id == "img-3":
+            if image.size == (2, 2):
                 return [("general", "1girl"), ("rating", "safe")]
             return [("general", "1girl")]
 
@@ -342,6 +367,13 @@ def test_batch_runner_force_mode_unbinds_only_managed_old_tags_and_preserves_per
         if request.method in {"DELETE", "PUT"} and request.url.path.endswith("/assets"):
             return httpx.Response(status_code=204)
 
+        if request.method == "GET" and request.url.path.endswith("/thumbnail"):
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "image/png"},
+                content=_png_bytes(),
+            )
+
         return _json_response(404, {"message": "Not found"})
 
     config = AppConfig(
@@ -410,3 +442,392 @@ def test_batch_runner_fast_fails_when_micro_batch_write_back_fails() -> None:
     assert exc_info.value.status_code == 500
     # Batch 1 aborted at first asset-binding call; batch 2 never ran
     assert len(write_requests) == 2
+
+
+def test_batch_runner_fetches_configured_thumbnail_size_decodes_in_memory_and_closes_image() -> None:
+    seen_images: list[Image.Image] = []
+    seen_thumb_requests: list[tuple[str, str]] = []
+
+    class RecordingVisionPipeline:
+        def predict(
+            self, image: Image.Image, mode: RoutingMode
+        ) -> Sequence[tuple[str, str]]:
+            # Prior image must already be closed before processing the next asset
+            for prev in seen_images:
+                with pytest.raises(ValueError, match="closed image"):
+                    prev.getpixel((0, 0))
+            assert image.getpixel((0, 0)) == (10, 20, 30)
+            seen_images.append(image)
+            return [("general", "1girl")]
+
+    base_transport = _sample_transport([])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/thumbnail"):
+            seen_thumb_requests.append((request.url.path, request.url.params.get("size", "")))
+        return base_transport.handle_request(request)
+
+    config = AppConfig(
+        immich=ImmichConfig(
+            base_url="http://immich.local:2283",
+            api_key="secret",
+            thumbnail_size="thumbnail",
+        ),
+        batch=BatchConfig(size=2),
+        albums=[AlbumConfig(name="Anime Album", mode="anime")],
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        runner = BatchRunner(
+            config=config,
+            client=client,
+            vision_pipeline=RecordingVisionPipeline(),
+        )
+        summary = runner.run(dry_run=True)
+
+    assert summary.processed_count == 2
+    assert seen_thumb_requests == [
+        ("/api/assets/img-1/thumbnail", "thumbnail"),
+        ("/api/assets/img-2/thumbnail", "thumbnail"),
+    ]
+    assert len(seen_images) == 2
+    for img in seen_images:
+        with pytest.raises(ValueError, match="closed image"):
+            img.getpixel((0, 0))
+
+
+def test_batch_runner_skips_missing_or_corrupt_thumbnails_with_warning_and_writes_remaining(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    write_events: list[tuple[str, str, object]] = []
+    predicted_count = 0
+
+    class CountingVisionPipeline:
+        def predict(
+            self, image: Image.Image, mode: RoutingMode
+        ) -> Sequence[tuple[str, str]]:
+            nonlocal predicted_count
+            predicted_count += 1
+            return [("general", "1girl")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-mixed":
+            return _json_response(
+                200,
+                {
+                    "id": "album-mixed",
+                    "albumName": "Mixed Health",
+                    "assets": [
+                        {
+                            "id": "img-404",
+                            "type": "IMAGE",
+                            "originalFileName": "missing_thumb.png",
+                            "exifInfo": {"exifImageWidth": 1600, "exifImageHeight": 1200},
+                            "tags": [],
+                        },
+                        {
+                            "id": "img-corrupt",
+                            "type": "IMAGE",
+                            "originalFileName": "corrupt_bytes.png",
+                            "exifInfo": {"exifImageWidth": 1600, "exifImageHeight": 1200},
+                            "tags": [],
+                        },
+                        {
+                            "id": "img-ok",
+                            "type": "IMAGE",
+                            "originalFileName": "healthy.png",
+                            "exifInfo": {"exifImageWidth": 3200, "exifImageHeight": 2400},
+                            "tags": [],
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/img-404/thumbnail":
+            return _json_response(404, {"message": "Thumbnail not generated"})
+        if request.method == "GET" and request.url.path == "/api/assets/img-corrupt/thumbnail":
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "image/png"},
+                content=b"not-a-valid-image-stream",
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/img-ok/thumbnail":
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "image/png"},
+                content=_png_bytes(),
+            )
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            write_events.append((request.method, request.url.path, body))
+            return _json_response(
+                200, [{"id": f"t-{i}", "value": v} for i, v in enumerate(body["tags"])]
+            )
+        if request.method == "PUT" and request.url.path.endswith("/assets"):
+            body = json.loads(request.content.decode("utf-8"))
+            write_events.append((request.method, request.url.path, body))
+            return httpx.Response(status_code=204)
+        return _json_response(404, {"message": "Not found"})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        batch=BatchConfig(size=10),
+        albums=[AlbumConfig(id="album-mixed", mode="anime")],
+    )
+
+    caplog.set_level(logging.WARNING)
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        runner = BatchRunner(
+            config=config, client=client, vision_pipeline=CountingVisionPipeline()
+        )
+        summary = runner.run(dry_run=False)
+
+    assert summary.total_eligible == 3
+    assert summary.processed_count == 1
+    assert summary.skipped_count == 2
+    assert predicted_count == 1
+    assert [r.asset_id for r in summary.results] == ["img-ok"]
+
+    warning_messages = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("img-404" in msg and "missing_thumb.png" in msg for msg in warning_messages)
+    assert any("img-corrupt" in msg and "corrupt_bytes.png" in msg for msg in warning_messages)
+
+    # Only img-ok receives tags and meta/booru_tagged
+    assert write_events == [
+        ("PUT", "/api/tags", {"tags": ["general/1girl", "meta/absurdres", "meta/booru_tagged"]}),
+        ("PUT", "/api/tags/t-0/assets", {"ids": ["img-ok"]}),
+        ("PUT", "/api/tags/t-1/assets", {"ids": ["img-ok"]}),
+        ("PUT", "/api/tags/t-2/assets", {"ids": ["img-ok"]}),
+    ]
+
+
+def test_batch_runner_skips_decompression_bomb_thumbnail_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 4)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-bomb":
+            return _json_response(
+                200,
+                {
+                    "id": "album-bomb",
+                    "albumName": "Bomb Check",
+                    "assets": [
+                        {
+                            "id": "img-bomb",
+                            "type": "IMAGE",
+                            "originalFileName": "huge.png",
+                            "exifInfo": None,
+                            "tags": [],
+                        },
+                        {
+                            "id": "img-small",
+                            "type": "IMAGE",
+                            "originalFileName": "ok.png",
+                            "exifInfo": None,
+                            "tags": [],
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/img-bomb/thumbnail":
+            return httpx.Response(200, content=_png_bytes(4, 4))  # 16 px > 4 px limit
+        if request.method == "GET" and request.url.path == "/api/assets/img-small/thumbnail":
+            return httpx.Response(200, content=_png_bytes(2, 2))  # 4 px <= 4 px limit
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        albums=[AlbumConfig(id="album-bomb", mode="anime")],
+    )
+
+    caplog.set_level(logging.WARNING)
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        runner = BatchRunner(config=config, client=client)
+        summary = runner.run(dry_run=True)
+
+    assert summary.processed_count == 1
+    assert summary.skipped_count == 1
+    assert [r.asset_id for r in summary.results] == ["img-small"]
+    assert any(
+        "img-bomb" in rec.getMessage() and "huge.png" in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING
+    )
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_batch_runner_fast_fails_on_thumbnail_auth_error(status_code: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-auth":
+            return _json_response(
+                200,
+                {
+                    "id": "album-auth",
+                    "albumName": "Auth Check",
+                    "assets": [
+                        {
+                            "id": "img-1",
+                            "type": "IMAGE",
+                            "originalFileName": "pic.png",
+                            "exifInfo": None,
+                            "tags": [],
+                        }
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/thumbnail"):
+            return _json_response(status_code, {"message": "Unauthorized"})
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        albums=[AlbumConfig(id="album-auth", mode="anime")],
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        runner = BatchRunner(config=config, client=client)
+        with pytest.raises(ImmichApiError) as exc_info:
+            runner.run(dry_run=False)
+
+    assert exc_info.value.status_code == status_code
+
+
+def test_anime_album_end_to_end_with_default_vision_pipeline_and_truncated_image_skip() -> None:
+    seen_thresholds: list[tuple[float, float]] = []
+    write_events: list[tuple[str, str, object]] = []
+    tag_ids: dict[str, str] = {}
+
+    class FakeAnimeBackend:
+        def extract_pixai(
+            self,
+            image: Image.Image,
+            *,
+            general_threshold: float,
+            character_threshold: float,
+        ) -> tuple[Mapping[str, float], Mapping[str, float], Mapping[str, float]]:
+            seen_thresholds.append((general_threshold, character_threshold))
+            if image.size == (3, 3):
+                return (
+                    {"1girl": 0.96, "Blue Eyes": 0.8},
+                    {"Artoria Pendragon": 0.92},
+                    {"Fate/Grand Order": 0.9},
+                )
+            return ({"solo": 0.9}, {}, {})
+
+        def extract_rating_scores(self, image: Image.Image) -> Mapping[str, float]:
+            if image.size == (3, 3):
+                return {"general": 0.1, "sensitive": 0.2, "questionable": 0.65, "explicit": 0.05}
+            return {"general": 0.9, "sensitive": 0.05, "questionable": 0.03, "explicit": 0.02}
+
+        def classify_medium(self, image: Image.Image) -> tuple[str, float]:
+            return ("illustration", 0.95) if image.size == (3, 3) else ("not_painting", 0.9)
+
+        def classify_completeness(self, image: Image.Image) -> tuple[str, float]:
+            return ("polished", 0.94) if image.size == (3, 3) else ("monochrome", 0.88)
+
+    valid_3x3 = _png_bytes(3, 3)
+    valid_2x2 = _png_bytes(2, 2)
+    truncated_png = valid_2x2[:16]  # valid PNG header but corrupted/truncated body on load()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-anime-e2e":
+            return _json_response(
+                200,
+                {
+                    "id": "album-anime-e2e",
+                    "albumName": "Anime E2E",
+                    "assets": [
+                        {
+                            "id": "a-illu",
+                            "type": "IMAGE",
+                            "originalFileName": "saber.png",
+                            "exifInfo": {"exifImageWidth": 4000, "exifImageHeight": 3000},
+                            "tags": [],
+                        },
+                        {
+                            "id": "a-not-painting",
+                            "type": "IMAGE",
+                            "originalFileName": "ui_screenshot.png",
+                            "exifInfo": {"exifImageWidth": 1000, "exifImageHeight": 800},
+                            "tags": [],
+                        },
+                        {
+                            "id": "a-truncated",
+                            "type": "IMAGE",
+                            "originalFileName": "truncated.png",
+                            "exifInfo": {"exifImageWidth": 1000, "exifImageHeight": 800},
+                            "tags": [],
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/a-illu/thumbnail":
+            return httpx.Response(200, content=valid_3x3)
+        if request.method == "GET" and request.url.path == "/api/assets/a-not-painting/thumbnail":
+            return httpx.Response(200, content=valid_2x2)
+        if request.method == "GET" and request.url.path == "/api/assets/a-truncated/thumbnail":
+            return httpx.Response(200, content=truncated_png)
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            write_events.append((request.method, request.url.path, body))
+            created = []
+            for value in body["tags"]:
+                tid = tag_ids.setdefault(value, f"tid-{len(tag_ids) + 1}")
+                created.append({"id": tid, "value": value})
+            return _json_response(200, created)
+        if request.method == "PUT" and request.url.path.endswith("/assets"):
+            body = json.loads(request.content.decode("utf-8"))
+            write_events.append((request.method, request.url.path, body))
+            return httpx.Response(status_code=204)
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        batch=BatchConfig(size=10),
+        pipeline=PipelinesConfig(
+            anime=PipelineThresholdConfig(general_threshold=0.42, character_threshold=0.88)
+        ),
+        albums=[AlbumConfig(id="album-anime-e2e", mode="anime")],
+    )
+    vision_pipeline = DefaultVisionPipeline(
+        config.pipeline,
+        anime_backend=FakeAnimeBackend(),
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        runner = BatchRunner(
+            config=config, client=client, vision_pipeline=vision_pipeline
+        )
+        summary = runner.run(dry_run=False)
+
+    assert summary.processed_count == 2
+    assert summary.skipped_count == 1
+    assert seen_thresholds == [(0.42, 0.88), (0.42, 0.88)]
+
+    by_id = {r.asset_id: r for r in summary.results}
+    assert by_id["a-illu"].tags == [
+        "general/1girl",
+        "general/blue_eyes",
+        "character/artoria_pendragon",
+        "copyright/fate_grand_order",
+        "rating/questionable",
+        "meta/illustration",
+        "meta/polished",
+        "meta/absurdres",
+    ]
+    assert by_id["a-not-painting"].tags == [
+        "general/solo",
+        "rating/general",
+        "meta/monochrome",
+    ]
+    assert "meta/not_painting" not in by_id["a-not-painting"].tags
+    assert "a-truncated" not in by_id
+
+    marker_id = tag_ids["meta/booru_tagged"]
+    assert write_events[-1] == (
+        "PUT",
+        f"/api/tags/{marker_id}/assets",
+        {"ids": ["a-illu", "a-not-painting"]},
+    )

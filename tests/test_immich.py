@@ -258,3 +258,57 @@ def test_tag_and_untag_assets_send_expected_requests_and_handle_empty_body() -> 
         ("PUT", "/api/tags/tag-1/assets", {"ids": ["a-1", "a-2"]}),
         ("DELETE", "/api/tags/tag-2/assets", {"ids": ["a-1"]}),
     ]
+
+
+def test_fetch_asset_thumbnail_requests_size_and_returns_raw_bytes() -> None:
+    seen_requests: list[httpx.Request] = []
+    png_payload = b"\x89PNG\r\n\x1a\nfake-thumbnail-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        if request.method == "GET" and request.url.path == "/api/assets/asset-99/thumbnail":
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "image/png"},
+                content=png_payload,
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="my-secret-key",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        data = client.fetch_asset_thumbnail("asset-99", size="thumbnail")
+
+    assert data == png_payload
+    assert len(seen_requests) == 1
+    assert seen_requests[0].url.path == "/api/assets/asset-99/thumbnail"
+    assert seen_requests[0].url.params["size"] == "thumbnail"
+    assert seen_requests[0].headers["x-api-key"] == "my-secret-key"
+
+
+def test_fetch_asset_thumbnail_raises_immich_api_error_on_http_or_transport_failure() -> None:
+    def handler_404(request: httpx.Request) -> httpx.Response:
+        return _json_response(404, {"message": "Thumbnail missing"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler_404),
+    ) as client:
+        with pytest.raises(ImmichApiError) as exc_info:
+            client.fetch_asset_thumbnail("missing-asset")
+    assert exc_info.value.status_code == 404
+
+    def handler_transport_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler_transport_error),
+    ) as client:
+        with pytest.raises(ImmichApiError) as exc_info2:
+            client.fetch_asset_thumbnail("asset-1")
+    assert exc_info2.value.status_code is None

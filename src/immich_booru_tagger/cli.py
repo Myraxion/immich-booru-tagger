@@ -11,6 +11,11 @@ import httpx
 
 from immich_booru_tagger.config import ConfigError, load_config
 from immich_booru_tagger.immich import ImmichClient, ImmichError
+from immich_booru_tagger.pipeline import (
+    DefaultVisionPipeline,
+    PipelineError,
+    VisionPipeline,
+)
 from immich_booru_tagger.runner import BatchRunner, RunSummary
 
 
@@ -59,6 +64,7 @@ def _print_summary(summary: RunSummary) -> None:
         f"scanned={summary.total_assets_scanned}, "
         f"eligible={summary.total_eligible}, "
         f"processed={summary.processed_count}, "
+        f"skipped={summary.skipped_count}, "
         f"batches={summary.batches_count}, "
         f"dry_run={summary.dry_run}"
     )
@@ -68,6 +74,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     transport: httpx.BaseTransport | None = None,
+    vision_pipeline: VisionPipeline | None = None,
 ) -> int:
     """CLI main entrypoint."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -75,14 +82,23 @@ def main(
 
     try:
         config = load_config(args.config)
+        active_pipeline: VisionPipeline = (
+            vision_pipeline
+            if vision_pipeline is not None
+            else DefaultVisionPipeline(config.pipeline)
+        )
         with ImmichClient.from_config(config, transport=transport) as client:
-            runner = BatchRunner(config=config, client=client)
+            runner = BatchRunner(
+                config=config,
+                client=client,
+                vision_pipeline=active_pipeline,
+            )
             summary = runner.run(
                 dry_run=args.dry_run,
                 limit=args.limit,
                 force=args.force,
             )
-    except (ConfigError, ImmichError, ValueError) as exc:
+    except (ConfigError, ImmichError, PipelineError, NotImplementedError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

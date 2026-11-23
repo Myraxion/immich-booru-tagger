@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+
+from PIL import Image, UnidentifiedImageError
 
 from immich_booru_tagger.config import AppConfig, RoutingMode
-from immich_booru_tagger.immich import ImmichAsset, ImmichClient, TargetAlbum
+from immich_booru_tagger.immich import (
+    ImmichApiError,
+    ImmichAsset,
+    ImmichClient,
+    TargetAlbum,
+)
+from immich_booru_tagger.pipeline import VisionPipeline
 from immich_booru_tagger.rules import (
     PROCESSED_MARKER,
     compute_dimension_meta_tags,
@@ -16,16 +24,6 @@ from immich_booru_tagger.rules import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class VisionPipeline(Protocol):
-    """Port reserved for vision-based Booru tag prediction."""
-
-    def predict(
-        self, asset: ImmichAsset, mode: RoutingMode
-    ) -> Sequence[tuple[str, str]]:
-        """Predict raw (category, tag_name) pairs for a single asset."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +49,7 @@ class RunSummary:
     batches_count: int
     dry_run: bool
     results: list[AssetTagResult]
+    skipped_count: int = 0
 
 
 class BatchRunner:
@@ -91,6 +90,7 @@ class BatchRunner:
         ]
 
         results: list[AssetTagResult] = []
+        skipped_count = 0
         for batch_index, batch in enumerate(batches, start=1):
             logger.info(
                 "Processing micro-batch %d/%d (%d assets, dry_run=%s)",
@@ -102,7 +102,15 @@ class BatchRunner:
             batch_updates: list[tuple[ImmichAsset, list[str]]] = []
             log_prefix = "[dry-run] " if dry_run else ""
             for album, asset in batch:
-                tags = self._compute_asset_tags(asset, album.mode)
+                image = self._load_thumbnail_image(asset)
+                if image is None:
+                    skipped_count += 1
+                    continue
+                try:
+                    tags = self._compute_asset_tags(asset, image, album.mode)
+                finally:
+                    image.close()
+
                 logger.info(
                     "%sasset=%s (%s) album=%s mode=%s tags=%s",
                     log_prefix,
@@ -124,7 +132,7 @@ class BatchRunner:
                     )
                 )
 
-            if not dry_run:
+            if not dry_run and batch_updates:
                 self._client.sync_batch_tags(batch_updates, force=force)
 
         return RunSummary(
@@ -135,12 +143,53 @@ class BatchRunner:
             batches_count=len(batches),
             dry_run=dry_run,
             results=results,
+            skipped_count=skipped_count,
         )
 
-    def _compute_asset_tags(self, asset: ImmichAsset, mode: RoutingMode) -> list[str]:
+    def _load_thumbnail_image(self, asset: ImmichAsset) -> Image.Image | None:
+        try:
+            raw_bytes = self._client.fetch_asset_thumbnail(
+                asset.id, size=self._config.immich.thumbnail_size
+            )
+        except ImmichApiError as exc:
+            if exc.status_code in (401, 403):
+                raise
+            logger.warning(
+                "Skipping asset %s (%s): failed to fetch thumbnail: %s",
+                asset.id,
+                asset.original_file_name,
+                exc,
+            )
+            return None
+
+        image: Image.Image | None = None
+        try:
+            image = Image.open(io.BytesIO(raw_bytes))
+            image.load()
+            return image
+        except (
+            UnidentifiedImageError,
+            Image.DecompressionBombError,
+            OSError,
+            EOFError,
+            SyntaxError,
+        ) as exc:
+            if image is not None:
+                image.close()
+            logger.warning(
+                "Skipping asset %s (%s): failed to decode thumbnail image: %s",
+                asset.id,
+                asset.original_file_name,
+                exc,
+            )
+            return None
+
+    def _compute_asset_tags(
+        self, asset: ImmichAsset, image: Image.Image, mode: RoutingMode
+    ) -> list[str]:
         raw_tags: list[str] = []
         if self._vision_pipeline is not None:
-            for category, tag_name in self._vision_pipeline.predict(asset, mode):
+            for category, tag_name in self._vision_pipeline.predict(image, mode):
                 raw_tags.append(normalize_booru_tag(category, tag_name))
 
         raw_tags.extend(compute_dimension_meta_tags(asset.width, asset.height))
