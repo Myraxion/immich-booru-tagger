@@ -10,6 +10,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from immich_booru_tagger.config import AlbumConfig, AppConfig, RoutingMode
+from immich_booru_tagger.rules import PROCESSED_MARKER, is_managed_tag
 
 
 class ImmichError(RuntimeError):
@@ -111,6 +112,12 @@ class TargetAlbum(BaseModel):
     assets: list[ImmichAsset]
 
 
+def _append_unique(mapping: dict[str, list[str]], key: str, value: str) -> None:
+    bucket = mapping.setdefault(key, [])
+    if value not in bucket:
+        bucket.append(value)
+
+
 class ImmichClient:
     """Synchronous HTTP client wrapper for Immich REST APIs."""
 
@@ -124,6 +131,7 @@ class ImmichClient:
         client: httpx.Client | None = None,
     ) -> None:
         self._owns_client = client is None
+        self._tag_cache: dict[str, str] = {}
         self._client = (
             client
             if client is not None
@@ -192,6 +200,91 @@ class ImmichClient:
 
         return resolved
 
+    def ensure_tags(self, tag_values: Sequence[str]) -> dict[str, str]:
+        """Upsert any unknown tags in Immich and return value -> id mapping."""
+        unique_values = list(dict.fromkeys(tag_values))
+        unknown = [value for value in unique_values if value not in self._tag_cache]
+        if unknown:
+            payload = self._request_json("PUT", "/api/tags", json={"tags": unknown})
+            if not isinstance(payload, list):
+                raise ImmichApiError("Expected JSON list from PUT /api/tags")
+            for item in payload:
+                parsed = ImmichTag.model_validate(item)
+                if parsed.id:
+                    self._tag_cache[parsed.value] = parsed.id
+
+            missing = [value for value in unknown if value not in self._tag_cache]
+            if missing:
+                raise ImmichApiError(
+                    f"PUT /api/tags did not return tag IDs for: {', '.join(missing)}"
+                )
+
+        return {value: self._tag_cache[value] for value in unique_values}
+
+    def tag_assets(self, tag_id: str, asset_ids: Sequence[str]) -> None:
+        """Attach an existing tag ID to the given asset IDs."""
+        if not asset_ids:
+            return
+        self._request_json("PUT", f"/api/tags/{tag_id}/assets", json={"ids": list(asset_ids)})
+
+    def untag_assets(self, tag_id: str, asset_ids: Sequence[str]) -> None:
+        """Detach an existing tag ID from the given asset IDs."""
+        if not asset_ids:
+            return
+        self._request_json("DELETE", f"/api/tags/{tag_id}/assets", json={"ids": list(asset_ids)})
+
+    def sync_batch_tags(
+        self,
+        batch_updates: Sequence[tuple[ImmichAsset, Sequence[str]]],
+        *,
+        force: bool = False,
+    ) -> None:
+        """Persist one Micro-batch of asset tags and PROCESSED_MARKER to Immich."""
+        if not batch_updates:
+            return
+
+        if force:
+            self._unbind_managed_tags([asset for asset, _ in batch_updates])
+
+        assets_by_tag: dict[str, list[str]] = {}
+        all_asset_ids: list[str] = []
+        for asset, tags in batch_updates:
+            if asset.id not in all_asset_ids:
+                all_asset_ids.append(asset.id)
+            for tag_value in dict.fromkeys(tags):
+                if tag_value == PROCESSED_MARKER:
+                    continue
+                _append_unique(assets_by_tag, tag_value, asset.id)
+
+        tags_to_ensure = [*assets_by_tag.keys(), PROCESSED_MARKER]
+        tag_id_map = self.ensure_tags(tags_to_ensure)
+
+        for tag_value, asset_ids in assets_by_tag.items():
+            self.tag_assets(tag_id_map[tag_value], asset_ids)
+
+        self.tag_assets(tag_id_map[PROCESSED_MARKER], all_asset_ids)
+
+    def _unbind_managed_tags(self, assets: Sequence[ImmichAsset]) -> None:
+        managed_pairs: list[tuple[ImmichTag, str]] = [
+            (tag, asset.id)
+            for asset in assets
+            for tag in asset.tags
+            if is_managed_tag(tag.value)
+        ]
+        if not managed_pairs:
+            return
+
+        missing_values = [tag.value for tag, _ in managed_pairs if not tag.id]
+        resolved_ids = self.ensure_tags(missing_values) if missing_values else {}
+
+        assets_by_tag_id: dict[str, list[str]] = {}
+        for tag, asset_id in managed_pairs:
+            tag_id = tag.id or resolved_ids[tag.value]
+            _append_unique(assets_by_tag_id, tag_id, asset_id)
+
+        for tag_id, asset_ids in assets_by_tag_id.items():
+            self.untag_assets(tag_id, asset_ids)
+
     def _list_albums(self) -> list[_AlbumSummaryPayload]:
         payload = self._request_json("GET", "/api/albums")
         if not isinstance(payload, list):
@@ -221,9 +314,9 @@ class ImmichClient:
             )
         return matches[0].id
 
-    def _request_json(self, method: str, path: str) -> Any:
+    def _request_json(self, method: str, path: str, *, json: Any = None) -> Any:
         try:
-            response = self._client.request(method, path)
+            response = self._client.request(method, path, json=json)
         except httpx.HTTPError as exc:
             raise ImmichApiError(f"Immich request {method} {path} failed: {exc}") from exc
 
@@ -232,5 +325,8 @@ class ImmichClient:
                 f"Immich API error {response.status_code} on {method} {path}: {response.text}",
                 status_code=response.status_code,
             )
+
+        if response.status_code == 204 or not response.content:
+            return None
 
         return response.json()

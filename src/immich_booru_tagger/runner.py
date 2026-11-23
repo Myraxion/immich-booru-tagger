@@ -78,11 +78,6 @@ class BatchRunner:
         if limit is not None and limit <= 0:
             raise ValueError(f"limit must be a positive integer, got {limit}")
 
-        if not dry_run:
-            raise NotImplementedError(
-                "Immich write-back is not implemented yet; run with --dry-run."
-            )
-
         resolved_albums = self._client.resolve_target_albums(self._config.albums)
         total_scanned, eligible_pairs = self._collect_eligible_assets(
             resolved_albums, force=force
@@ -104,16 +99,20 @@ class BatchRunner:
                 len(batch),
                 dry_run,
             )
+            batch_updates: list[tuple[ImmichAsset, list[str]]] = []
+            log_prefix = "[dry-run] " if dry_run else ""
             for album, asset in batch:
                 tags = self._compute_asset_tags(asset, album.mode)
                 logger.info(
-                    "[dry-run] asset=%s (%s) album=%s mode=%s tags=%s",
+                    "%sasset=%s (%s) album=%s mode=%s tags=%s",
+                    log_prefix,
                     asset.id,
                     asset.original_file_name,
                     album.name,
                     album.mode,
                     tags,
                 )
+                batch_updates.append((asset, tags))
                 results.append(
                     AssetTagResult(
                         asset_id=asset.id,
@@ -124,6 +123,9 @@ class BatchRunner:
                         tags=tags,
                     )
                 )
+
+            if not dry_run:
+                self._client.sync_batch_tags(batch_updates, force=force)
 
         return RunSummary(
             albums_resolved=len(resolved_albums),

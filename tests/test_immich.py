@@ -197,3 +197,64 @@ def test_resolve_target_album_fails_on_auth_error() -> None:
     ) as client:
         with pytest.raises(ImmichApiError):
             client.resolve_target_albums([AlbumConfig(id="album-1")])
+
+
+def test_ensure_tags_caches_tag_ids_and_skips_upsert_on_cache_hit() -> None:
+    upsert_calls: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            tags = body["tags"]
+            upsert_calls.append(tags)
+            return _json_response(
+                200,
+                [
+                    {"id": f"id-{i}", "name": tag} if i % 2 else {"id": f"id-{i}", "value": tag}
+                    for i, tag in enumerate(tags, start=len(upsert_calls) * 10)
+                ],
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        first = client.ensure_tags(["general/1girl", "meta/absurdres", "general/1girl"])
+        second = client.ensure_tags(["meta/absurdres", "meta/booru_tagged"])
+        third = client.ensure_tags(["general/1girl", "meta/booru_tagged"])
+
+    assert upsert_calls == [
+        ["general/1girl", "meta/absurdres"],
+        ["meta/booru_tagged"],
+    ]
+    assert first == {"general/1girl": "id-10", "meta/absurdres": "id-11"}
+    assert second == {"meta/absurdres": "id-11", "meta/booru_tagged": "id-20"}
+    assert third == {"general/1girl": "id-10", "meta/booru_tagged": "id-20"}
+
+
+def test_tag_and_untag_assets_send_expected_requests_and_handle_empty_body() -> None:
+    seen: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        seen.append((request.method, request.url.path, body))
+        if request.method == "PUT" and request.url.path == "/api/tags/tag-1/assets":
+            return httpx.Response(status_code=204)
+        if request.method == "DELETE" and request.url.path == "/api/tags/tag-2/assets":
+            return _json_response(200, [{"id": "a-1", "success": True}])
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        client.tag_assets("tag-1", ["a-1", "a-2"])
+        client.untag_assets("tag-2", ["a-1"])
+
+    assert seen == [
+        ("PUT", "/api/tags/tag-1/assets", {"ids": ["a-1", "a-2"]}),
+        ("DELETE", "/api/tags/tag-2/assets", {"ids": ["a-1"]}),
+    ]

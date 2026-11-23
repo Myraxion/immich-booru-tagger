@@ -187,3 +187,78 @@ name = "SameName"
     assert exit_dup != 0
     assert "uuid-111" in err_dup
     assert "uuid-222" in err_dup
+
+
+def test_cli_non_dry_run_with_force_writes_tags_and_cleans_old_managed_tags(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        """
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "k"
+
+[batch]
+size = 2
+
+[[albums]]
+id = "alb-1"
+mode = "anime"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    write_events: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/alb-1":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-1",
+                    "albumName": "Illustrations",
+                    "assets": [
+                        {
+                            "id": "a-1",
+                            "type": "IMAGE",
+                            "originalFileName": "retag.png",
+                            "exifInfo": {"exifImageWidth": 3200, "exifImageHeight": 2400},
+                            "tags": [
+                                {"id": "old-m", "value": "meta/booru_tagged"},
+                                {"id": "user-keep", "value": "my_favorite"},
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        write_events.append((request.method, request.url.path, body))
+
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            assert isinstance(body, dict)
+            return _json_response(
+                200,
+                [{"id": f"new-{i}", "value": v} for i, v in enumerate(body["tags"])],
+            )
+        if request.method in {"DELETE", "PUT"} and request.url.path.endswith("/assets"):
+            return httpx.Response(status_code=204)
+        return _json_response(404, {})
+
+    exit_code = main(
+        ["-c", str(cfg_file), "--force"],
+        transport=httpx.MockTransport(handler),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "dry_run=False" in out
+    assert "[dry-run]" not in out
+    assert write_events == [
+        ("DELETE", "/api/tags/old-m/assets", {"ids": ["a-1"]}),
+        ("PUT", "/api/tags", {"tags": ["meta/absurdres", "meta/booru_tagged"]}),
+        ("PUT", "/api/tags/new-0/assets", {"ids": ["a-1"]}),
+        ("PUT", "/api/tags/new-1/assets", {"ids": ["a-1"]}),
+    ]
