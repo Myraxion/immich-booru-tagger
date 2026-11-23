@@ -337,6 +337,83 @@ def test_resolve_target_album_fetches_asset_detail_when_tags_omitted_from_album_
     assert albums[0].assets[0].tag_values == {"meta/booru_tagged"}
 
 
+def test_resolve_target_album_falls_back_to_metadata_search_with_pagination() -> None:
+    seen_pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-v3":
+            return _json_response(
+                200,
+                {
+                    "id": "album-v3",
+                    "albumName": "ImmichV3Album",
+                    "assetCount": 2,
+                },
+            )
+        if request.method == "POST" and request.url.path == "/api/search/metadata":
+            body = json.loads(request.content.decode("utf-8"))
+            page = body["page"]
+            seen_pages.append(page)
+            assert body["albumIds"] == ["album-v3"]
+            assert body["withExif"] is True
+            if page == 1:
+                return _json_response(
+                    200,
+                    {
+                        "assets": {
+                            "items": [
+                                {
+                                    "id": "a-1",
+                                    "type": "IMAGE",
+                                    "originalFileName": "p1.png",
+                                    "exifInfo": {"exifImageWidth": 1920, "exifImageHeight": 1080},
+                                }
+                            ],
+                            "nextPage": "2",
+                        }
+                    },
+                )
+            return _json_response(
+                200,
+                {
+                    "assets": {
+                        "items": [
+                            {
+                                "id": "a-2",
+                                "type": "IMAGE",
+                                "originalFileName": "p2.png",
+                                "tags": [{"id": "t-1", "value": "meta/booru_tagged"}],
+                            }
+                        ],
+                        "nextPage": None,
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/a-1":
+            return _json_response(
+                200,
+                {
+                    "id": "a-1",
+                    "type": "IMAGE",
+                    "originalFileName": "p1.png",
+                    "tags": [],
+                },
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        albums = client.resolve_target_albums([AlbumConfig(id="album-v3")])
+
+    assert seen_pages == [1, 2]
+    assert [asset.id for asset in albums[0].assets] == ["a-1", "a-2"]
+    assert albums[0].assets[0].tag_values == set()
+    assert albums[0].assets[1].tag_values == {"meta/booru_tagged"}
+
+
 def test_fetch_asset_thumbnail_raises_immich_api_error_on_http_or_transport_failure() -> None:
     def handler_404(request: httpx.Request) -> httpx.Response:
         return _json_response(404, {"message": "Thumbnail missing"})

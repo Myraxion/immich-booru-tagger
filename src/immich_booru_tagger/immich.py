@@ -108,6 +108,7 @@ class _AlbumSummaryPayload(BaseModel):
 
 
 class _AlbumDetailPayload(_AlbumSummaryPayload):
+    asset_count: int = Field(default=0, alias="assetCount")
     assets: list[ImmichAsset] = Field(default_factory=list)
 
 
@@ -197,8 +198,13 @@ class ImmichClient:
                 album_id = self._match_album_by_name(all_albums, album_cfg.name)
 
             detail = self._get_album_detail(album_id)
+            raw_assets = (
+                detail.assets
+                if detail.assets or detail.asset_count == 0
+                else self._search_album_assets(album_id)
+            )
             enriched_assets = [
-                self._enrich_asset_tags_if_missing(asset) for asset in detail.assets
+                self._enrich_asset_tags_if_missing(asset) for asset in raw_assets
             ]
             resolved.append(
                 TargetAlbum(
@@ -210,6 +216,37 @@ class ImmichClient:
             )
 
         return resolved
+
+    def _search_album_assets(self, album_id: str) -> list[ImmichAsset]:
+        assets: list[ImmichAsset] = []
+        page = 1
+        while True:
+            payload = self._request_json(
+                "POST",
+                "/api/search/metadata",
+                json={
+                    "albumIds": [album_id],
+                    "page": page,
+                    "size": 250,
+                    "withExif": True,
+                },
+            )
+            if not isinstance(payload, dict):
+                raise ImmichApiError("Expected JSON object from POST /api/search/metadata")
+            assets_section = payload.get("assets")
+            if not isinstance(assets_section, dict):
+                raise ImmichApiError("Missing 'assets' object in POST /api/search/metadata response")
+            items = assets_section.get("items") or []
+            if not isinstance(items, list):
+                raise ImmichApiError("Expected 'assets.items' list from POST /api/search/metadata")
+            assets.extend(ImmichAsset.model_validate(item) for item in items)
+
+            next_page = assets_section.get("nextPage")
+            if not next_page:
+                break
+            page = int(next_page)
+
+        return assets
 
     def _enrich_asset_tags_if_missing(self, asset: ImmichAsset) -> ImmichAsset:
         if asset.type != "IMAGE" or asset.tags_present:
