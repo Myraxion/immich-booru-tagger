@@ -48,3 +48,7 @@ strict = true
 warn_unused_configs = true
 mypy_path = "src"
 packages = ["immich_booru_tagger"]
+
+[[tool.mypy.overrides]]
+module = ["imgutils", "imgutils.*", "realutils", "realutils.*"]
+ignore_missing_imports = true

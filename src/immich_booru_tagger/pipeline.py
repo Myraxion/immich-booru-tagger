@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Generic, Protocol, TypeVar
@@ -235,6 +236,18 @@ def _coerce_tag_score_triple(
     )
 
 
+def _ensure_hf_token_env() -> None:
+    """Propagate cached huggingface_hub CLI token to HF_TOKEN for hfutils clients."""
+    if os.environ.get("HF_TOKEN", "").strip():
+        return
+    try:
+        from huggingface_hub import get_token
+    except ImportError:
+        return
+    if token := get_token():
+        os.environ["HF_TOKEN"] = token
+
+
 class ImgutilsAnimeBackend:
     """Lazy-loaded dghs-imgutils adapter implementing AnimeBackend."""
 
@@ -253,15 +266,16 @@ class ImgutilsAnimeBackend:
     def load(cls) -> ImgutilsAnimeBackend:
         """Lazily import dghs-imgutils modules and initialize ONNX models."""
         try:
-            import imgutils.generic as generic_module  # type: ignore[import-not-found]
-            import imgutils.tagging as tagging_module  # type: ignore[import-not-found]
-            import imgutils.validate as validate_module  # type: ignore[import-not-found]
+            import imgutils.generic as generic_module
+            import imgutils.tagging as tagging_module
+            import imgutils.validate as validate_module
         except ImportError as exc:
             raise PipelineDependencyError(
                 "dghs-imgutils is required for anime vision inference; "
                 "install the 'cpu' or 'gpu' optional extra."
             ) from exc
 
+        _ensure_hf_token_env()
         rating_model = generic_module.MultiLabelTIMMModel(ANIME_RATING_REPO_ID)
         return cls(
             tagging_module=tagging_module,
@@ -325,7 +339,7 @@ class RealutilsRealBackend:
     def load(cls) -> RealutilsRealBackend:
         """Lazily import dghs-realutils tagging module."""
         try:
-            import realutils.tagging as tagging_module  # type: ignore[import-not-found]
+            import realutils.tagging as tagging_module
         except ImportError as exc:
             raise PipelineDependencyError(
                 "dghs-realutils is required for real vision inference; "
