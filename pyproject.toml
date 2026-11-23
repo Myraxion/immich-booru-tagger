@@ -3,7 +3,7 @@ name = "immich-booru-tagger"
 version = "0.1.0"
 description = "Stateless local automated Booru tagging CLI tool for Immich."
 readme = "DESIGN.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "httpx>=0.27.0",
     "pillow>=10.0.0",
