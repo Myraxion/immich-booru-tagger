@@ -1,0 +1,236 @@
+"""Immich REST API client and domain response models."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from types import TracebackType
+from typing import Any
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from immich_booru_tagger.config import AlbumConfig, AppConfig, RoutingMode
+
+
+class ImmichError(RuntimeError):
+    """Base error for Immich API interactions."""
+
+
+class ImmichApiError(ImmichError):
+    """Raised when Immich returns an unexpected HTTP error or transport failure."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class AlbumNotFoundError(ImmichError):
+    """Raised when a configured Target Album cannot be found."""
+
+
+class AmbiguousAlbumError(ImmichError):
+    """Raised when an album name matches more than one album."""
+
+
+class ImmichTag(BaseModel):
+    """Tag attached to an Immich asset."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = ""
+    value: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_name_to_value(cls, data: Any) -> Any:
+        if isinstance(data, dict) and not data.get("value") and data.get("name"):
+            return {**data, "value": data["name"]}
+        return data
+
+
+class ExifInfo(BaseModel):
+    """EXIF metadata subset needed for deterministic dimension rules."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    exif_image_width: int | None = Field(default=None, alias="exifImageWidth")
+    exif_image_height: int | None = Field(default=None, alias="exifImageHeight")
+
+
+class ImmichAsset(BaseModel):
+    """Immich asset metadata parsed from album endpoints."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str
+    type: str
+    original_file_name: str = Field(default="", alias="originalFileName")
+    exif_info: ExifInfo | None = Field(default=None, alias="exifInfo")
+    tags: list[ImmichTag] = Field(default_factory=list)
+
+    @field_validator("original_file_name", mode="before")
+    @classmethod
+    def _coerce_null_file_name(cls, value: Any) -> Any:
+        return "" if value is None else value
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _coerce_null_tags(cls, value: Any) -> Any:
+        return [] if value is None else value
+
+    @property
+    def width(self) -> int | None:
+        return self.exif_info.exif_image_width if self.exif_info is not None else None
+
+    @property
+    def height(self) -> int | None:
+        return self.exif_info.exif_image_height if self.exif_info is not None else None
+
+    @property
+    def tag_values(self) -> set[str]:
+        return {tag.value for tag in self.tags}
+
+
+class _AlbumSummaryPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str
+    album_name: str = Field(default="", alias="albumName")
+
+
+class _AlbumDetailPayload(_AlbumSummaryPayload):
+    assets: list[ImmichAsset] = Field(default_factory=list)
+
+
+class TargetAlbum(BaseModel):
+    """Resolved Target Album with its configured Routing Mode and assets."""
+
+    id: str
+    name: str
+    mode: RoutingMode
+    assets: list[ImmichAsset]
+
+
+class ImmichClient:
+    """Synchronous HTTP client wrapper for Immich REST APIs."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout: float = 30.0,
+        transport: httpx.BaseTransport | None = None,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._owns_client = client is None
+        self._client = (
+            client
+            if client is not None
+            else httpx.Client(
+                base_url=base_url.rstrip("/"),
+                headers={"x-api-key": api_key},
+                timeout=timeout,
+                transport=transport,
+            )
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: AppConfig,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> ImmichClient:
+        """Construct an ImmichClient from a validated AppConfig."""
+        return cls(
+            base_url=config.immich.base_url,
+            api_key=config.immich.api_key,
+            timeout=config.immich.timeout,
+            transport=transport,
+        )
+
+    def __enter__(self) -> ImmichClient:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the underlying httpx.Client if owned by this instance."""
+        if self._owns_client:
+            self._client.close()
+
+    def resolve_target_albums(self, album_configs: Sequence[AlbumConfig]) -> list[TargetAlbum]:
+        """Resolve all configured Target Albums into concrete TargetAlbum objects."""
+        all_albums: list[_AlbumSummaryPayload] | None = None
+        resolved: list[TargetAlbum] = []
+
+        for album_cfg in album_configs:
+            if album_cfg.id is not None:
+                album_id = album_cfg.id
+            else:
+                assert album_cfg.name is not None
+                if all_albums is None:
+                    all_albums = self._list_albums()
+                album_id = self._match_album_by_name(all_albums, album_cfg.name)
+
+            detail = self._get_album_detail(album_id)
+            resolved.append(
+                TargetAlbum(
+                    id=detail.id,
+                    name=detail.album_name,
+                    mode=album_cfg.mode,
+                    assets=detail.assets,
+                )
+            )
+
+        return resolved
+
+    def _list_albums(self) -> list[_AlbumSummaryPayload]:
+        payload = self._request_json("GET", "/api/albums")
+        if not isinstance(payload, list):
+            raise ImmichApiError("Expected JSON list from GET /api/albums")
+        return [_AlbumSummaryPayload.model_validate(item) for item in payload]
+
+    def _get_album_detail(self, album_id: str) -> _AlbumDetailPayload:
+        try:
+            payload = self._request_json("GET", f"/api/albums/{album_id}")
+        except ImmichApiError as exc:
+            if exc.status_code == 404:
+                raise AlbumNotFoundError(f"Album not found by id: {album_id!r}") from exc
+            raise
+        return _AlbumDetailPayload.model_validate(payload)
+
+    @staticmethod
+    def _match_album_by_name(
+        albums: Sequence[_AlbumSummaryPayload], name: str
+    ) -> str:
+        matches = [album for album in albums if album.album_name == name]
+        if not matches:
+            raise AlbumNotFoundError(f"Album not found by name: {name!r}")
+        if len(matches) > 1:
+            candidate_ids = ", ".join(album.id for album in matches)
+            raise AmbiguousAlbumError(
+                f"Multiple albums match name {name!r}: {candidate_ids}"
+            )
+        return matches[0].id
+
+    def _request_json(self, method: str, path: str) -> Any:
+        try:
+            response = self._client.request(method, path)
+        except httpx.HTTPError as exc:
+            raise ImmichApiError(f"Immich request {method} {path} failed: {exc}") from exc
+
+        if response.is_error:
+            raise ImmichApiError(
+                f"Immich API error {response.status_code} on {method} {path}: {response.text}",
+                status_code=response.status_code,
+            )
+
+        return response.json()
