@@ -288,6 +288,55 @@ def test_fetch_asset_thumbnail_requests_size_and_returns_raw_bytes() -> None:
     assert seen_requests[0].headers["x-api-key"] == "my-secret-key"
 
 
+def test_resolve_target_album_fetches_asset_detail_when_tags_omitted_from_album_payload() -> None:
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.method == "GET" and request.url.path == "/api/albums/album-v2":
+            return _json_response(
+                200,
+                {
+                    "id": "album-v2",
+                    "albumName": "ImmichV2Album",
+                    "assets": [
+                        {
+                            "id": "asset-no-tags-key",
+                            "type": "IMAGE",
+                            "originalFileName": "v2.png",
+                            "exifInfo": {"exifImageWidth": 2000, "exifImageHeight": 1500},
+                        },
+                        {
+                            "id": "asset-video-no-tags",
+                            "type": "VIDEO",
+                            "originalFileName": "clip.mp4",
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/asset-no-tags-key":
+            return _json_response(
+                200,
+                {
+                    "id": "asset-no-tags-key",
+                    "type": "IMAGE",
+                    "originalFileName": "v2.png",
+                    "tags": [{"id": "t-1", "value": "meta/booru_tagged"}],
+                },
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        albums = client.resolve_target_albums([AlbumConfig(id="album-v2")])
+
+    assert seen_paths == ["/api/albums/album-v2", "/api/assets/asset-no-tags-key"]
+    assert albums[0].assets[0].tag_values == {"meta/booru_tagged"}
+
+
 def test_fetch_asset_thumbnail_raises_immich_api_error_on_http_or_transport_failure() -> None:
     def handler_404(request: httpx.Request) -> httpx.Response:
         return _json_response(404, {"message": "Thumbnail missing"})

@@ -68,6 +68,14 @@ class ImmichAsset(BaseModel):
     original_file_name: str = Field(default="", alias="originalFileName")
     exif_info: ExifInfo | None = Field(default=None, alias="exifInfo")
     tags: list[ImmichTag] = Field(default_factory=list)
+    tags_present: bool = Field(default=False, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _track_tags_presence(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "tags" in data and data["tags"] is not None:
+            return {**data, "tags_present": True}
+        return data
 
     @field_validator("original_file_name", mode="before")
     @classmethod
@@ -189,16 +197,36 @@ class ImmichClient:
                 album_id = self._match_album_by_name(all_albums, album_cfg.name)
 
             detail = self._get_album_detail(album_id)
+            enriched_assets = [
+                self._enrich_asset_tags_if_missing(asset) for asset in detail.assets
+            ]
             resolved.append(
                 TargetAlbum(
                     id=detail.id,
                     name=detail.album_name,
                     mode=album_cfg.mode,
-                    assets=detail.assets,
+                    assets=enriched_assets,
                 )
             )
 
         return resolved
+
+    def _enrich_asset_tags_if_missing(self, asset: ImmichAsset) -> ImmichAsset:
+        if asset.type != "IMAGE" or asset.tags_present:
+            return asset
+        payload = self._request_json("GET", f"/api/assets/{asset.id}")
+        if not isinstance(payload, dict):
+            raise ImmichApiError(
+                f"Expected JSON object from GET /api/assets/{asset.id}"
+            )
+        detailed = ImmichAsset.model_validate(payload)
+        return asset.model_copy(
+            update={
+                "tags": detailed.tags,
+                "tags_present": True,
+                "exif_info": asset.exif_info or detailed.exif_info,
+            }
+        )
 
     def fetch_asset_thumbnail(
         self, asset_id: str, size: ThumbnailSize = "preview"

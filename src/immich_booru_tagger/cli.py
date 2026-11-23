@@ -98,7 +98,7 @@ def main(
                 limit=args.limit,
                 force=args.force,
             )
-    except (ConfigError, ImmichError, PipelineError, NotImplementedError, ValueError) as exc:
+    except (ConfigError, ImmichError, PipelineError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
