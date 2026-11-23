@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol
+from typing import Any, Generic, Protocol, TypeVar
 
 from PIL import Image
 
@@ -14,10 +14,16 @@ PIXAI_MODEL_NAME = "v0.9"
 ANIME_RATING_REPO_ID = "animetimm/mobilenetv3_large_150d.dbv4-full"
 ANIME_CLASSIFY_MODEL_NAME = "mobilenetv3_v1.3_dist"
 ANIME_COMPLETENESS_MODEL_NAME = "mobilenetv3_v2.2_dist"
+ANIME_REAL_MODEL_NAME = "mobilenetv3_v1.2_dist"
 
 DANBOORU_RATINGS: tuple[str, ...] = (
     "general",
     "sensitive",
+    "questionable",
+    "explicit",
+)
+SANKAKU_RATINGS: tuple[str, ...] = (
+    "safe",
     "questionable",
     "explicit",
 )
@@ -67,6 +73,20 @@ class AnimeBackend(Protocol):
         ...
 
 
+def _select_top_rating(
+    rating_scores: Mapping[str, float],
+    allowed_levels: tuple[str, ...],
+) -> str | None:
+    filtered = {
+        level: float(rating_scores[level])
+        for level in allowed_levels
+        if level in rating_scores
+    }
+    if not filtered:
+        return None
+    return max(filtered, key=lambda level: filtered[level])
+
+
 class AnimePipeline:
     """Four-stage Anime Pipeline combining semantic tagging, rating, medium, and completeness."""
 
@@ -100,13 +120,8 @@ class AnimePipeline:
         tags.extend(("copyright", tag_name) for tag_name in copyright_tags)
 
         rating_scores = backend.extract_rating_scores(image)
-        filtered_ratings = {
-            level: float(rating_scores[level])
-            for level in DANBOORU_RATINGS
-            if level in rating_scores
-        }
-        if filtered_ratings:
-            top_rating = max(filtered_ratings, key=lambda level: filtered_ratings[level])
+        top_rating = _select_top_rating(rating_scores, DANBOORU_RATINGS)
+        if top_rating is not None:
             tags.append(("rating", top_rating))
 
         medium_label, _ = backend.classify_medium(image)
@@ -120,8 +135,77 @@ class AnimePipeline:
         return tags
 
 
-_SHARED_ANIME_BACKEND_LOCK = threading.Lock()
-_SHARED_ANIME_BACKEND: AnimeBackend | None = None
+class RealBackend(Protocol):
+    """Low-level inference backend port for the Real Pipeline."""
+
+    def extract_idolsankaku(
+        self,
+        image: Image.Image,
+        *,
+        general_threshold: float,
+        character_threshold: float,
+    ) -> tuple[Mapping[str, float], Mapping[str, float], Mapping[str, float]]:
+        """Return (rating_scores, general_scores, character_scores)."""
+        ...
+
+
+class RealPipeline:
+    """Real-world photo tagging pipeline backed by IdolSankaku."""
+
+    def __init__(
+        self,
+        thresholds: PipelineThresholdConfig | None = None,
+        *,
+        backend_factory: Callable[[], RealBackend] | None = None,
+    ) -> None:
+        self._thresholds = thresholds or PipelineThresholdConfig()
+        self._backend_factory = backend_factory or get_shared_real_backend
+        self._backend: RealBackend | None = None
+
+    def _get_backend(self) -> RealBackend:
+        if self._backend is None:
+            self._backend = self._backend_factory()
+        return self._backend
+
+    def predict(self, image: Image.Image) -> list[tuple[str, str]]:
+        """Predict Booru (category, tag_name) pairs for a real-world photo."""
+        backend = self._get_backend()
+        rating_scores, general, character = backend.extract_idolsankaku(
+            image,
+            general_threshold=self._thresholds.general_threshold,
+            character_threshold=self._thresholds.character_threshold,
+        )
+        tags: list[tuple[str, str]] = []
+        tags.extend(("general", tag_name) for tag_name in general)
+        tags.extend(("character", tag_name) for tag_name in character)
+
+        top_rating = _select_top_rating(rating_scores, SANKAKU_RATINGS)
+        if top_rating is not None:
+            tags.append(("rating", top_rating))
+        return tags
+
+
+_T = TypeVar("_T")
+
+
+class _LazySingleton(Generic[_T]):
+    """Thread-safe process-level lazy singleton holder."""
+
+    def __init__(self, default_loader: Callable[[], _T]) -> None:
+        self._default_loader = default_loader
+        self._lock = threading.Lock()
+        self._instance: _T | None = None
+
+    def get(self, loader: Callable[[], _T] | None = None) -> _T:
+        with self._lock:
+            if self._instance is None:
+                active_loader = loader or self._default_loader
+                self._instance = active_loader()
+            return self._instance
+
+    def clear(self) -> None:
+        with self._lock:
+            self._instance = None
 
 
 def _coerce_tag_scores(raw: Any) -> dict[str, float]:
@@ -135,6 +219,20 @@ def _coerce_tag_scores(raw: Any) -> dict[str, float]:
     if isinstance(raw, Sequence | set | frozenset) and not isinstance(raw, str | bytes):
         return {item: 1.0 for item in raw if isinstance(item, str) and item.strip()}
     return {}
+
+
+def _coerce_tag_score_triple(
+    raw_result: Any, *, source: str
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    if not isinstance(raw_result, tuple) or len(raw_result) < 3:
+        raise PipelineError(
+            f"Unexpected {source} output: {type(raw_result).__name__}"
+        )
+    return (
+        _coerce_tag_scores(raw_result[0]),
+        _coerce_tag_scores(raw_result[1]),
+        _coerce_tag_scores(raw_result[2]),
+    )
 
 
 class ImgutilsAnimeBackend:
@@ -187,15 +285,7 @@ class ImgutilsAnimeBackend:
             },
             fmt=("general", "character", "ips"),
         )
-        if not isinstance(raw_result, tuple) or len(raw_result) < 3:
-            raise PipelineError(
-                f"Unexpected get_pixai_tags output: {type(raw_result).__name__}"
-            )
-        return (
-            _coerce_tag_scores(raw_result[0]),
-            _coerce_tag_scores(raw_result[1]),
-            _coerce_tag_scores(raw_result[2]),
-        )
+        return _coerce_tag_score_triple(raw_result, source="get_pixai_tags")
 
     def extract_rating_scores(self, image: Image.Image) -> Mapping[str, float]:
         raw_result = self._rating_model.predict(
@@ -225,23 +315,130 @@ class ImgutilsAnimeBackend:
         return str(label), float(score)
 
 
+class RealutilsRealBackend:
+    """Lazy-loaded dghs-realutils adapter implementing RealBackend."""
+
+    def __init__(self, *, tagging_module: Any) -> None:
+        self._tagging = tagging_module
+
+    @classmethod
+    def load(cls) -> RealutilsRealBackend:
+        """Lazily import dghs-realutils tagging module."""
+        try:
+            import realutils.tagging as tagging_module  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise PipelineDependencyError(
+                "dghs-realutils is required for real vision inference; "
+                "install the 'cpu' or 'gpu' optional extra."
+            ) from exc
+
+        return cls(tagging_module=tagging_module)
+
+    def extract_idolsankaku(
+        self,
+        image: Image.Image,
+        *,
+        general_threshold: float,
+        character_threshold: float,
+    ) -> tuple[Mapping[str, float], Mapping[str, float], Mapping[str, float]]:
+        raw_result = self._tagging.get_idolsankaku_tags(
+            image,
+            general_threshold=general_threshold,
+            character_threshold=character_threshold,
+            fmt=("rating", "general", "character"),
+        )
+        return _coerce_tag_score_triple(raw_result, source="get_idolsankaku_tags")
+
+
+class DomainClassifier(Protocol):
+    """Low-level domain classification port distinguishing anime vs real images."""
+
+    def classify_domain(self, image: Image.Image) -> tuple[str, float]:
+        """Return (label, score) where label is 'anime' or 'real'."""
+        ...
+
+
+class ImgutilsDomainClassifier:
+    """Lazy-loaded dghs-imgutils adapter implementing DomainClassifier."""
+
+    def __init__(self, *, validate_module: Any) -> None:
+        self._validate = validate_module
+
+    @classmethod
+    def load(cls) -> ImgutilsDomainClassifier:
+        """Lazily import dghs-imgutils validate module."""
+        try:
+            import imgutils.validate as validate_module
+        except ImportError as exc:
+            raise PipelineDependencyError(
+                "dghs-imgutils is required for domain classification; "
+                "install the 'cpu' or 'gpu' optional extra."
+            ) from exc
+
+        return cls(validate_module=validate_module)
+
+    def classify_domain(self, image: Image.Image) -> tuple[str, float]:
+        label, score = self._validate.anime_real(
+            image, model_name=ANIME_REAL_MODEL_NAME
+        )
+        return str(label), float(score)
+
+
+_SHARED_ANIME_BACKEND: _LazySingleton[AnimeBackend] = _LazySingleton(
+    ImgutilsAnimeBackend.load
+)
+_SHARED_REAL_BACKEND: _LazySingleton[RealBackend] = _LazySingleton(
+    RealutilsRealBackend.load
+)
+_SHARED_DOMAIN_CLASSIFIER: _LazySingleton[DomainClassifier] = _LazySingleton(
+    ImgutilsDomainClassifier.load
+)
+
+
 def clear_shared_anime_backend_cache() -> None:
     """Clear the process-level cached AnimeBackend singleton."""
-    global _SHARED_ANIME_BACKEND
-    with _SHARED_ANIME_BACKEND_LOCK:
-        _SHARED_ANIME_BACKEND = None
+    _SHARED_ANIME_BACKEND.clear()
 
 
 def get_shared_anime_backend(
     loader: Callable[[], AnimeBackend] | None = None,
 ) -> AnimeBackend:
     """Return the process-level lazy-loaded AnimeBackend singleton."""
-    global _SHARED_ANIME_BACKEND
-    with _SHARED_ANIME_BACKEND_LOCK:
-        if _SHARED_ANIME_BACKEND is None:
-            active_loader = loader or ImgutilsAnimeBackend.load
-            _SHARED_ANIME_BACKEND = active_loader()
-        return _SHARED_ANIME_BACKEND
+    return _SHARED_ANIME_BACKEND.get(loader)
+
+
+def clear_shared_real_backend_cache() -> None:
+    """Clear the process-level cached RealBackend singleton."""
+    _SHARED_REAL_BACKEND.clear()
+
+
+def get_shared_real_backend(
+    loader: Callable[[], RealBackend] | None = None,
+) -> RealBackend:
+    """Return the process-level lazy-loaded RealBackend singleton."""
+    return _SHARED_REAL_BACKEND.get(loader)
+
+
+def clear_shared_domain_classifier_cache() -> None:
+    """Clear the process-level cached DomainClassifier singleton."""
+    _SHARED_DOMAIN_CLASSIFIER.clear()
+
+
+def get_shared_domain_classifier(
+    loader: Callable[[], DomainClassifier] | None = None,
+) -> DomainClassifier:
+    """Return the process-level lazy-loaded DomainClassifier singleton."""
+    return _SHARED_DOMAIN_CLASSIFIER.get(loader)
+
+
+def _resolve_factory(
+    instance: _T | None,
+    factory: Callable[[], _T] | None,
+    default_factory: Callable[[], _T],
+) -> Callable[[], _T]:
+    if instance is not None:
+        return lambda: instance
+    return factory or default_factory
 
 
 class DefaultVisionPipeline:
@@ -253,17 +450,26 @@ class DefaultVisionPipeline:
         *,
         anime_backend: AnimeBackend | None = None,
         anime_backend_factory: Callable[[], AnimeBackend] | None = None,
+        real_backend: RealBackend | None = None,
+        real_backend_factory: Callable[[], RealBackend] | None = None,
+        domain_classifier: DomainClassifier | None = None,
+        domain_classifier_factory: Callable[[], DomainClassifier] | None = None,
     ) -> None:
         self._config = config or PipelinesConfig()
-        if anime_backend is not None:
-            self._anime_backend_factory: Callable[[], AnimeBackend] = (
-                lambda: anime_backend
-            )
-        else:
-            self._anime_backend_factory = (
-                anime_backend_factory or get_shared_anime_backend
-            )
+        self._anime_backend_factory = _resolve_factory(
+            anime_backend, anime_backend_factory, get_shared_anime_backend
+        )
+        self._real_backend_factory = _resolve_factory(
+            real_backend, real_backend_factory, get_shared_real_backend
+        )
+        self._domain_classifier_factory = _resolve_factory(
+            domain_classifier,
+            domain_classifier_factory,
+            get_shared_domain_classifier,
+        )
         self._anime_pipeline: AnimePipeline | None = None
+        self._real_pipeline: RealPipeline | None = None
+        self._domain_classifier: DomainClassifier | None = None
 
     def _get_anime_pipeline(self) -> AnimePipeline:
         if self._anime_pipeline is None:
@@ -273,12 +479,34 @@ class DefaultVisionPipeline:
             )
         return self._anime_pipeline
 
+    def _get_real_pipeline(self) -> RealPipeline:
+        if self._real_pipeline is None:
+            self._real_pipeline = RealPipeline(
+                self._config.real,
+                backend_factory=self._real_backend_factory,
+            )
+        return self._real_pipeline
+
+    def _get_domain_classifier(self) -> DomainClassifier:
+        if self._domain_classifier is None:
+            self._domain_classifier = self._domain_classifier_factory()
+        return self._domain_classifier
+
     def predict(
         self, image: Image.Image, mode: RoutingMode
     ) -> Sequence[tuple[str, str]]:
         """Predict raw (category, tag_name) pairs for a decoded image under RoutingMode."""
         if mode == "anime":
             return self._get_anime_pipeline().predict(image)
-        raise NotImplementedError(
-            f"Routing mode {mode!r} is not implemented yet; only 'anime' is supported"
-        )
+        if mode == "real":
+            return self._get_real_pipeline().predict(image)
+        if mode == "auto":
+            domain, _ = self._get_domain_classifier().classify_domain(image)
+            if domain == "anime":
+                return self._get_anime_pipeline().predict(image)
+            if domain == "real":
+                return self._get_real_pipeline().predict(image)
+            raise PipelineError(
+                f"Unexpected domain classification label: {domain!r}"
+            )
+        raise PipelineError(f"Unsupported routing mode: {mode!r}")

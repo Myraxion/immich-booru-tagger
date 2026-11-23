@@ -831,3 +831,279 @@ def test_anime_album_end_to_end_with_default_vision_pipeline_and_truncated_image
         f"/api/tags/{marker_id}/assets",
         {"ids": ["a-illu", "a-not-painting"]},
     )
+
+
+def test_mixed_albums_auto_anime_real_routing_end_to_end() -> None:
+    anime_thresholds_seen: list[tuple[float, float]] = []
+    real_thresholds_seen: list[tuple[float, float]] = []
+    classifier_sizes_seen: list[tuple[int, int]] = []
+    tag_ids: dict[str, str] = {}
+    write_events: list[tuple[str, str, object]] = []
+
+    class FakeAnimeBackend:
+        def extract_pixai(
+            self,
+            image: Image.Image,
+            *,
+            general_threshold: float,
+            character_threshold: float,
+        ) -> tuple[Mapping[str, float], Mapping[str, float], Mapping[str, float]]:
+            anime_thresholds_seen.append((general_threshold, character_threshold))
+            return ({"1girl": 0.94}, {"hatsune_miku": 0.91}, {"vocaloid": 0.9})
+
+        def extract_rating_scores(self, image: Image.Image) -> Mapping[str, float]:
+            return {"general": 0.05, "sensitive": 0.85, "questionable": 0.07, "explicit": 0.03}
+
+        def classify_medium(self, image: Image.Image) -> tuple[str, float]:
+            return ("illustration", 0.95)
+
+        def classify_completeness(self, image: Image.Image) -> tuple[str, float]:
+            return ("polished", 0.93)
+
+    class FakeRealBackend:
+        def extract_idolsankaku(
+            self,
+            image: Image.Image,
+            *,
+            general_threshold: float,
+            character_threshold: float,
+        ) -> tuple[Mapping[str, float], Mapping[str, float], Mapping[str, float]]:
+            real_thresholds_seen.append((general_threshold, character_threshold))
+            if image.size == (5, 5):
+                return (
+                    {"safe": 0.88, "questionable": 0.09, "explicit": 0.03},
+                    {"solo": 0.9, "blue dress": 0.72},
+                    {"Idol Name": 0.93},
+                )
+            return (
+                {"safe": 0.12, "questionable": 0.18, "explicit": 0.70},
+                {"portrait": 0.87},
+                {},
+            )
+
+    class FakeDomainClassifier:
+        def classify_domain(self, image: Image.Image) -> tuple[str, float]:
+            classifier_sizes_seen.append(image.size)
+            return ("anime", 0.97) if image.size == (3, 3) else ("real", 0.96)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/alb-auto":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-auto",
+                    "albumName": "Mixed Auto",
+                    "assets": [
+                        {
+                            "id": "auto-anime",
+                            "type": "IMAGE",
+                            "originalFileName": "auto_anime.png",
+                            "exifInfo": {"exifImageWidth": 3200, "exifImageHeight": 2400},
+                            "tags": [],
+                        },
+                        {
+                            "id": "auto-real",
+                            "type": "IMAGE",
+                            "originalFileName": "auto_real.jpg",
+                            "exifInfo": {"exifImageWidth": 1600, "exifImageHeight": 1200},
+                            "tags": [],
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/albums/alb-anime":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-anime",
+                    "albumName": "Forced Anime",
+                    "assets": [
+                        {
+                            "id": "forced-anime",
+                            "type": "IMAGE",
+                            "originalFileName": "forced_anime.png",
+                            "exifInfo": {"exifImageWidth": 800, "exifImageHeight": 600},
+                            "tags": [],
+                        }
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/albums/alb-real":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-real",
+                    "albumName": "Forced Real",
+                    "assets": [
+                        {
+                            "id": "forced-real",
+                            "type": "IMAGE",
+                            "originalFileName": "forced_real.jpg",
+                            "exifInfo": {"exifImageWidth": 400, "exifImageHeight": 400},
+                            "tags": [],
+                        }
+                    ],
+                },
+            )
+        size_by_asset = {
+            "/api/assets/auto-anime/thumbnail": (3, 3),
+            "/api/assets/auto-real/thumbnail": (5, 5),
+            "/api/assets/forced-anime/thumbnail": (4, 4),
+            "/api/assets/forced-real/thumbnail": (6, 6),
+        }
+        if request.method == "GET" and request.url.path in size_by_asset:
+            return httpx.Response(200, content=_png_bytes(*size_by_asset[request.url.path]))
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            write_events.append((request.method, request.url.path, body))
+            created = []
+            for value in body["tags"]:
+                tid = tag_ids.setdefault(value, f"tid-{len(tag_ids) + 1}")
+                created.append({"id": tid, "value": value})
+            return _json_response(200, created)
+        if request.method == "PUT" and request.url.path.endswith("/assets"):
+            body = json.loads(request.content.decode("utf-8"))
+            write_events.append((request.method, request.url.path, body))
+            return httpx.Response(status_code=204)
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        batch=BatchConfig(size=10),
+        pipeline=PipelinesConfig(
+            anime=PipelineThresholdConfig(general_threshold=0.31, character_threshold=0.84),
+            real=PipelineThresholdConfig(general_threshold=0.44, character_threshold=0.79),
+        ),
+        albums=[
+            AlbumConfig(id="alb-auto"),  # defaults to mode="auto"
+            AlbumConfig(id="alb-anime", mode="anime"),
+            AlbumConfig(id="alb-real", mode="real"),
+        ],
+    )
+    vision_pipeline = DefaultVisionPipeline(
+        config.pipeline,
+        anime_backend=FakeAnimeBackend(),
+        real_backend=FakeRealBackend(),
+        domain_classifier=FakeDomainClassifier(),
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        runner = BatchRunner(
+            config=config, client=client, vision_pipeline=vision_pipeline
+        )
+        summary = runner.run(dry_run=False)
+
+    assert summary.albums_resolved == 3
+    assert summary.processed_count == 4
+    assert classifier_sizes_seen == [(3, 3), (5, 5)]
+    assert anime_thresholds_seen == [(0.31, 0.84), (0.31, 0.84)]
+    assert real_thresholds_seen == [(0.44, 0.79), (0.44, 0.79)]
+
+    by_id = {r.asset_id: r for r in summary.results}
+    assert by_id["auto-anime"].tags == [
+        "general/1girl",
+        "character/hatsune_miku",
+        "copyright/vocaloid",
+        "rating/sensitive",
+        "meta/illustration",
+        "meta/polished",
+        "meta/absurdres",
+    ]
+    assert by_id["auto-real"].tags == [
+        "general/solo",
+        "general/blue_dress",
+        "character/idol_name",
+        "rating/safe",
+        "meta/highres",
+    ]
+    assert by_id["forced-anime"].tags == [
+        "general/1girl",
+        "character/hatsune_miku",
+        "copyright/vocaloid",
+        "rating/sensitive",
+        "meta/illustration",
+        "meta/polished",
+    ]
+    assert by_id["forced-real"].tags == [
+        "general/portrait",
+        "rating/explicit",
+        "meta/lowres",
+    ]
+
+    marker_id = tag_ids["meta/booru_tagged"]
+    assert write_events[-1] == (
+        "PUT",
+        f"/api/tags/{marker_id}/assets",
+        {"ids": ["auto-anime", "auto-real", "forced-anime", "forced-real"]},
+    )
+
+
+def test_auto_album_with_only_real_images_never_loads_anime_backend() -> None:
+    anime_loads = 0
+    real_loads = 0
+
+    def fail_anime_load() -> object:
+        nonlocal anime_loads
+        anime_loads += 1
+        raise AssertionError("AnimeBackend should not be loaded")
+
+    class FakeRealBackend:
+        def extract_idolsankaku(
+            self,
+            image: Image.Image,
+            *,
+            general_threshold: float,
+            character_threshold: float,
+        ) -> tuple[Mapping[str, float], Mapping[str, float], Mapping[str, float]]:
+            return ({"safe": 0.9}, {"solo": 0.8}, {})
+
+    def load_real() -> FakeRealBackend:
+        nonlocal real_loads
+        real_loads += 1
+        return FakeRealBackend()
+
+    class AlwaysRealClassifier:
+        def classify_domain(self, image: Image.Image) -> tuple[str, float]:
+            return ("real", 0.99)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/alb-auto-real":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-auto-real",
+                    "albumName": "Auto All Real",
+                    "assets": [
+                        {
+                            "id": "r-1",
+                            "type": "IMAGE",
+                            "originalFileName": "photo.jpg",
+                            "exifInfo": None,
+                            "tags": [],
+                        }
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/thumbnail"):
+            return httpx.Response(200, content=_png_bytes(2, 2))
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        albums=[AlbumConfig(id="alb-auto-real")],
+    )
+    vision_pipeline = DefaultVisionPipeline(
+        config.pipeline,
+        anime_backend_factory=fail_anime_load,  # type: ignore[arg-type]
+        real_backend_factory=load_real,
+        domain_classifier=AlwaysRealClassifier(),
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        summary = BatchRunner(
+            config=config, client=client, vision_pipeline=vision_pipeline
+        ).run(dry_run=True)
+
+    assert anime_loads == 0
+    assert real_loads == 1
+    assert summary.results[0].tags == ["general/solo", "rating/safe"]
