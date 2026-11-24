@@ -28,14 +28,19 @@ name = "Anime Art"
     assert config.immich.thumbnail_size == "preview"
     assert config.immich.timeout == 30.0
     assert config.batch.size == 20
+    assert config.pipeline.enable_domain_tag is True
+    assert config.pipeline.enable_dimension_tags is True
     assert config.pipeline.anime.general_threshold == 0.35
     assert config.pipeline.anime.character_threshold == 0.85
+    assert config.pipeline.anime.enable_medium_classification is True
+    assert config.pipeline.anime.enable_completeness_classification is True
     assert config.pipeline.real.general_threshold == 0.35
     assert config.pipeline.real.character_threshold == 0.85
     assert len(config.albums) == 1
     assert config.albums[0].name == "Anime Art"
     assert config.albums[0].id is None
     assert config.albums[0].mode == "auto"
+    assert config.albums[0].extra_tags == []
 
 
 def test_load_config_parses_explicit_values(tmp_path: Path) -> None:
@@ -297,6 +302,70 @@ api_key = "secret-key"
 [[albums]]
 name = "Pixiv"
 artist_patterns = [{pattern!r}]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_file, env={})
+
+
+def test_load_config_parses_pipeline_switches_and_album_extra_tags(
+    tmp_path: Path,
+) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        """
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "secret-key"
+
+[pipeline]
+enable_domain_tag = false
+enable_dimension_tags = false
+
+[pipeline.anime]
+enable_medium_classification = false
+enable_completeness_classification = false
+
+[[albums]]
+name = "Pixiv"
+extra_tags = ["meta/Pixiv Art", "source/Pixiv", "  精选  "]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(cfg_file, env={})
+
+    assert config.pipeline.enable_domain_tag is False
+    assert config.pipeline.enable_dimension_tags is False
+    assert config.pipeline.anime.enable_medium_classification is False
+    assert config.pipeline.anime.enable_completeness_classification is False
+    assert config.albums[0].extra_tags == ["meta/pixiv_art", "source/Pixiv", "精选"]
+
+
+@pytest.mark.parametrize(
+    "extra_tag",
+    [
+        "",
+        "   ",
+        "meta/",
+        "general/   ",
+    ],
+)
+def test_load_config_rejects_empty_or_invalid_extra_tags(
+    tmp_path: Path, extra_tag: str
+) -> None:
+    cfg_file = tmp_path / "invalid_extra_tags.toml"
+    cfg_file.write_text(
+        f"""
+[immich]
+base_url = "http://127.0.0.1:2283"
+api_key = "secret-key"
+
+[[albums]]
+name = "Pixiv"
+extra_tags = [{extra_tag!r}]
 """.strip(),
         encoding="utf-8",
     )

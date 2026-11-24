@@ -9,6 +9,7 @@ from immich_booru_tagger.rules import (
     extract_artist_tag,
     is_managed_tag,
     normalize_booru_tag,
+    normalize_extra_tag,
 )
 
 
@@ -163,3 +164,26 @@ def test_extract_artist_tag_extracts_and_normalizes_first_match(
     file_name: str, patterns: list[str], expected: str | None
 ) -> None:
     assert extract_artist_tag(file_name, patterns) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_tag", "expected"),
+    [
+        ("meta/Pixiv Art", "meta/pixiv_art"),
+        ("META/Twitter / X", "meta/twitter_x"),
+        ("Artist/Mika Pikazo", "artist/mika_pikazo"),
+        ("source/Pixiv", "source/Pixiv"),
+        ("  精选  ", "精选"),
+        ("Pixiv", "Pixiv"),
+    ],
+)
+def test_normalize_extra_tag_handles_managed_and_free_tags(
+    raw_tag: str, expected: str
+) -> None:
+    assert normalize_extra_tag(raw_tag) == expected
+
+
+@pytest.mark.parametrize("raw_tag", ["", "   ", "meta/", "meta/   ", "artist/ / "])
+def test_normalize_extra_tag_rejects_empty_or_invalid_managed_tags(raw_tag: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_extra_tag(raw_tag)

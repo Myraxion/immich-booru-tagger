@@ -15,10 +15,20 @@ timeout = 30.0
 # 微批次（Micro-batch）大小：每处理满该数量资产立即向 Immich 批量写回一次标签
 size = 20
 
+[pipeline]
+# 是否在打标结果中附加域标签（meta/anime 或 meta/real），便于按域筛选
+enable_domain_tag = true
+# 是否基于原图 EXIF 尺寸计算分辨率与长宽比标签（meta/absurdres 等）
+enable_dimension_tags = true
+
 [pipeline.anime]
 # 二次元管线（anime_pixai）通用特征与角色标签置信度阈值（范围 0.0 ~ 1.0）
 general_threshold = 0.35
 character_threshold = 0.85
+# 是否启用二次元载体媒介识别（anime_classify：illustration / bangumi / comic / 3d）
+enable_medium_classification = true
+# 是否启用二次元完成度与色彩识别（anime_completeness：polished / rough / monochrome）
+enable_completeness_classification = true
 
 [pipeline.real]
 # 三次元管线（real_idolsankaku）通用特征与人物角色标签置信度阈值（范围 0.0 ~ 1.0）
@@ -36,6 +46,9 @@ mode = "auto"
 # [[albums]]
 # id = "00000000-0000-0000-0000-000000000000"
 # mode = "anime"
+# # 可选：为该相册内资产附加的专属标签（如来源平台标签）。
+# # 属于六大受管前缀（meta/、artist/ 等）的标签按 Booru 规范化并在 --force 时受管；其余标签原样保留。
+# extra_tags = ["meta/pixiv", "source/pixiv"]
 # # 可选：按顺序从去掉扩展名的文件名（stem）中提取 artist/<tag_name>，命中第一条有效规则即止
 # # 优先取命名捕获组 (?P<artist>...)，否则取第 1 个捕获组
 # artist_patterns = ['^\\[(?P<artist>[^\\]]+)\\]', '^pixiv_\\d+_(.+)$']

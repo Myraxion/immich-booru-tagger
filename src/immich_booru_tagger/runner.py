@@ -202,11 +202,13 @@ class BatchRunner:
             for category, tag_name in self._vision_pipeline.predict(image, album.mode):
                 raw_tags.append(normalize_booru_tag(category, tag_name))
 
-        raw_tags.extend(compute_dimension_meta_tags(asset.width, asset.height))
+        if self._config.pipeline.enable_dimension_tags:
+            raw_tags.extend(compute_dimension_meta_tags(asset.width, asset.height))
         if artist_tag := extract_artist_tag(
             asset.original_file_name, album.artist_patterns
         ):
             raw_tags.append(artist_tag)
+        raw_tags.extend(album.extra_tags)
         return list(dict.fromkeys(raw_tags))
 
     @staticmethod

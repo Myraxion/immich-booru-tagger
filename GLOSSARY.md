@@ -49,3 +49,11 @@ _Avoid_: Flat tag, nested path
 **Dimension Meta Tag（尺寸元数据标签）**:
 基于资产 EXIF 原图真实宽高确定性计算的 `meta/` 标签，包含互斥分辨率分档（`meta/absurdres`, `meta/highres`, `meta/lowres`）与极端长宽比标记（`meta/tall_image`, `meta/wide_image`）。
 _Avoid_: Thumbnail size tag, resolution category
+
+**Domain Meta Tag（域元数据标签）**:
+标识资产所属视觉域的受管 `meta/` 标签（`meta/anime` 与 `meta/real`），在开启域标签开关时，无论经由自动域分类还是相册显式 Routing Mode 进入对应管线均会附加。
+_Avoid_: Pipeline tag, category tag
+
+**Album Extra Tag（相册附加标签）**:
+绑定在 Target Album 上的额外标签列表，用于为相册内所有 Eligible Asset 附加来源平台等专属标记；命中 Managed Tag Namespace 前缀的标签遵循 Booru Hierarchical Tag 规范并受 `--force` 管理，其余自由标签原样保留且不受 `--force` 清理。
+_Avoid_: Album label, custom tag

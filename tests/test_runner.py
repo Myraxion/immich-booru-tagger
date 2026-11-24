@@ -11,6 +11,7 @@ from PIL import Image
 
 from immich_booru_tagger.config import (
     AlbumConfig,
+    AnimePipelineConfig,
     AppConfig,
     BatchConfig,
     ImmichConfig,
@@ -787,7 +788,7 @@ def test_anime_album_end_to_end_with_default_vision_pipeline_and_truncated_image
         immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
         batch=BatchConfig(size=10),
         pipeline=PipelinesConfig(
-            anime=PipelineThresholdConfig(general_threshold=0.42, character_threshold=0.88)
+            anime=AnimePipelineConfig(general_threshold=0.42, character_threshold=0.88)
         ),
         albums=[AlbumConfig(id="album-anime-e2e", mode="anime")],
     )
@@ -815,12 +816,14 @@ def test_anime_album_end_to_end_with_default_vision_pipeline_and_truncated_image
         "rating/questionable",
         "meta/illustration",
         "meta/polished",
+        "meta/anime",
         "meta/absurdres",
     ]
     assert by_id["a-not-painting"].tags == [
         "general/solo",
         "rating/general",
         "meta/monochrome",
+        "meta/anime",
     ]
     assert "meta/not_painting" not in by_id["a-not-painting"].tags
     assert "a-truncated" not in by_id
@@ -971,7 +974,7 @@ def test_mixed_albums_auto_anime_real_routing_end_to_end() -> None:
         immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
         batch=BatchConfig(size=10),
         pipeline=PipelinesConfig(
-            anime=PipelineThresholdConfig(general_threshold=0.31, character_threshold=0.84),
+            anime=AnimePipelineConfig(general_threshold=0.31, character_threshold=0.84),
             real=PipelineThresholdConfig(general_threshold=0.44, character_threshold=0.79),
         ),
         albums=[
@@ -1007,6 +1010,7 @@ def test_mixed_albums_auto_anime_real_routing_end_to_end() -> None:
         "rating/sensitive",
         "meta/illustration",
         "meta/polished",
+        "meta/anime",
         "meta/absurdres",
     ]
     assert by_id["auto-real"].tags == [
@@ -1014,6 +1018,7 @@ def test_mixed_albums_auto_anime_real_routing_end_to_end() -> None:
         "general/blue_dress",
         "character/idol_name",
         "rating/safe",
+        "meta/real",
         "meta/highres",
     ]
     assert by_id["forced-anime"].tags == [
@@ -1023,10 +1028,12 @@ def test_mixed_albums_auto_anime_real_routing_end_to_end() -> None:
         "rating/sensitive",
         "meta/illustration",
         "meta/polished",
+        "meta/anime",
     ]
     assert by_id["forced-real"].tags == [
         "general/portrait",
         "rating/explicit",
+        "meta/real",
         "meta/lowres",
     ]
 
@@ -1106,7 +1113,7 @@ def test_auto_album_with_only_real_images_never_loads_anime_backend() -> None:
 
     assert anime_loads == 0
     assert real_loads == 1
-    assert summary.results[0].tags == ["general/solo", "rating/safe"]
+    assert summary.results[0].tags == ["general/solo", "rating/safe", "meta/real"]
 
 
 def test_batch_runner_extracts_artist_tag_from_album_patterns_and_persists_to_immich() -> None:
@@ -1189,3 +1196,71 @@ def test_batch_runner_extracts_artist_tag_from_album_patterns_and_persists_to_im
     assert tagged_assets[tag_ids["artist/mika_pikazo"]] == ["a-1"]
     assert tagged_assets[tag_ids["artist/wlop"]] == ["a-2"]
     assert tagged_assets[tag_ids["meta/booru_tagged"]] == ["a-1", "a-2", "a-3"]
+
+
+def test_batch_runner_attaches_album_extra_tags_and_skips_dimension_tags_when_disabled() -> None:
+    delete_paths: list[str] = []
+    tagged_assets: dict[str, list[str]] = {}
+    tag_ids: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/alb-extra":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-extra",
+                    "albumName": "Pixiv Extra",
+                    "assets": [
+                        {
+                            "id": "a-1",
+                            "type": "IMAGE",
+                            "originalFileName": "pic.png",
+                            "exifInfo": {"exifImageWidth": 4000, "exifImageHeight": 3000},
+                            "tags": [
+                                {"id": "old-meta", "value": "meta/old_extra"},
+                                {"id": "free-src", "value": "source/Pixiv"},
+                            ],
+                        }
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/thumbnail"):
+            return httpx.Response(200, content=_png_bytes(2, 2))
+        if request.method == "DELETE" and request.url.path.endswith("/assets"):
+            delete_paths.append(request.url.path)
+            return httpx.Response(status_code=204)
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            items = []
+            for value in body["tags"]:
+                tid = tag_ids.setdefault(value, f"tid-{len(tag_ids) + 1}")
+                items.append({"id": tid, "value": value})
+            return _json_response(200, items)
+        if request.method == "PUT" and request.url.path.endswith("/assets"):
+            tag_id = request.url.path.split("/")[3]
+            body = json.loads(request.content.decode("utf-8"))
+            tagged_assets.setdefault(tag_id, []).extend(body["ids"])
+            return httpx.Response(status_code=204)
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        pipeline=PipelinesConfig(enable_dimension_tags=False),
+        albums=[
+            AlbumConfig(
+                id="alb-extra",
+                mode="anime",
+                extra_tags=["meta/Pixiv Art", "source/Pixiv", "精选"],
+            )
+        ],
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        summary = BatchRunner(config=config, client=client).run(force=True)
+
+    assert summary.results[0].tags == ["meta/pixiv_art", "source/Pixiv", "精选"]
+    assert delete_paths == ["/api/tags/old-meta/assets"]
+    assert "/api/tags/free-src/assets" not in delete_paths
+    assert tagged_assets[tag_ids["meta/pixiv_art"]] == ["a-1"]
+    assert tagged_assets[tag_ids["source/Pixiv"]] == ["a-1"]
+    assert tagged_assets[tag_ids["精选"]] == ["a-1"]

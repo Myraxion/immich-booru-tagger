@@ -7,11 +7,12 @@
 - **无中间服务、无本地数据库**：直接直连 Immich REST API，完全依托写回资产上的 `meta/booru_tagged` 标签实现增量检索与重复执行幂等性，不维护本地 SQLite 或状态文件。
 - **双域智能分流（`auto` / `anime` / `real`）**：
   - `auto` 模式通过轻量 `anime_real` 分类器自动判别二次元/三次元并路由到对应专用管线；
-  - 支持在相册级别强制指定 `anime` 或 `real` 跳过分类。
+  - 支持在相册级别强制指定 `anime` 或 `real` 跳过分类；
+  - 默认附加域标签 `meta/anime` / `meta/real`（可通过 `pipeline.enable_domain_tag` 关闭），方便直接按域筛选。
 - **二次元轻量精准组合（Anime Pipeline）**：
   - `anime_pixai` (`v0.9`) 提取 `general`、`character` 并自动推导作品版权 `copyright`（不通过视觉模型猜测画师 `artist`）；
   - `animetimm/mobilenetv3_large_150d.dbv4-full` 提取 Danbooru 原生四级分级（`general` / `sensitive` / `questionable` / `explicit`）；
-  - `anime_classify` 与 `anime_completeness` 提取媒介形式（`illustration` / `bangumi` / `comic` / `3d`，自动忽略 `not_painting`）与完成度（`polished` / `rough` / `monochrome`）。
+  - `anime_classify` 与 `anime_completeness` 可独立开关控制，分别提取媒介形式（`illustration` / `bangumi` / `comic` / `3d`，自动忽略 `not_painting`）与完成度（`polished` / `rough` / `monochrome`）。
 - **三次元专用管线（Real Pipeline）**：
   - 使用 `real_idolsankaku` 提取三次元 `character`、`general` 及 Sankaku 原生三级分级（`safe` / `questionable` / `explicit`）。
 - **EXIF 真实尺寸规则**：直接读取 Immich EXIF 原图真实宽高生成 `meta/absurdres`、`meta/highres`、`meta/lowres`、`meta/tall_image`、`meta/wide_image`，避免缩略图推理导致分辨率误判。
@@ -77,9 +78,15 @@ timeout = 30.0
 [batch]
 size = 20                         # 微批次大小，每满该数量资产立即向 Immich 写回一次
 
+[pipeline]
+enable_domain_tag = true          # 是否附加域标签（meta/anime 或 meta/real）
+enable_dimension_tags = true      # 是否启用 EXIF 原图尺寸规则（meta/absurdres 等）
+
 [pipeline.anime]
 general_threshold = 0.35
 character_threshold = 0.85
+enable_medium_classification = true        # 是否启用载体媒介识别（anime_classify）
+enable_completeness_classification = true  # 是否启用完成度识别（anime_completeness）
 
 [pipeline.real]
 general_threshold = 0.35
@@ -88,6 +95,7 @@ character_threshold = 0.85
 [[albums]]
 name = "Mixed Album"              # 每个相册必须且只能指定 name 或 id（UUID）之一
 mode = "auto"                     # "auto" | "anime" | "real"
+# extra_tags = ["meta/pixiv", "source/pixiv"]  # 可选：相册专属附加标签（受管前缀走 Booru 规范，其余原样保留）
 # artist_patterns = [             # 可选：按顺序从文件名（不含扩展名）提取 artist/* 标签，命中第一条有效规则即止
 #   '^\[(?P<artist>[^\]]+)\]',    # 优先读取 (?P<artist>...) 命名捕获组，否则取第 1 个捕获组
 #   '^pixiv_\d+_(.+)$',

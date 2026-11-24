@@ -9,7 +9,11 @@ from types import ModuleType
 import pytest
 from PIL import Image
 
-from immich_booru_tagger.config import PipelinesConfig, PipelineThresholdConfig
+from immich_booru_tagger.config import (
+    AnimePipelineConfig,
+    PipelinesConfig,
+    PipelineThresholdConfig,
+)
 from immich_booru_tagger.pipeline import (
     ANIME_RATING_REPO_ID,
     ANIME_REAL_MODEL_NAME,
@@ -83,7 +87,7 @@ def test_anime_pipeline_combines_pixai_rating_medium_and_completeness() -> None:
         completeness=("polished", 0.94),
     )
     pipeline = AnimePipeline(
-        PipelineThresholdConfig(general_threshold=0.4, character_threshold=0.9),
+        AnimePipelineConfig(general_threshold=0.4, character_threshold=0.9),
         backend_factory=lambda: backend,
     )
     image = Image.new("RGB", (4, 4), color=(255, 0, 0))
@@ -157,6 +161,7 @@ def test_default_vision_pipeline_lazy_loads_shared_anime_backend_once() -> None:
             ("rating", "general"),
             ("meta", "illustration"),
             ("meta", "polished"),
+            ("meta", "anime"),
         ]
     finally:
         clear_shared_anime_backend_cache()
@@ -306,7 +311,7 @@ def test_imgutils_anime_backend_contract_with_real_dghs_imgutils_signatures(
 
     try:
         config = PipelinesConfig(
-            anime=PipelineThresholdConfig(general_threshold=0.33, character_threshold=0.87)
+            anime=AnimePipelineConfig(general_threshold=0.33, character_threshold=0.87)
         )
         pipeline = DefaultVisionPipeline(config)
         img = Image.new("RGB", (4, 4))
@@ -321,6 +326,7 @@ def test_imgutils_anime_backend_contract_with_real_dghs_imgutils_signatures(
             ("rating", "sensitive"),
             ("meta", "illustration"),
             ("meta", "polished"),
+            ("meta", "anime"),
         ]
         assert recorded["timm_inits"] == [ANIME_RATING_REPO_ID]
         assert recorded["pixai_call"] == {
@@ -501,6 +507,7 @@ def test_default_vision_pipeline_real_mode_skips_anime_and_loads_real_lazily() -
         ("general", "photo"),
         ("character", "idol_a"),
         ("rating", "explicit"),
+        ("meta", "real"),
     ]
 
 
@@ -538,11 +545,12 @@ def test_default_vision_pipeline_auto_mode_routes_and_lazy_loads_only_needed_pip
     assert anime_init == 1
     assert real_init == 0
     assert ("rating", "general") in anime_tags
+    assert ("meta", "anime") in anime_tags
 
     real_tags = pipeline.predict(Image.new("RGB", (3, 3)), "auto")
     assert anime_init == 1
     assert real_init == 1
-    assert real_tags == [("general", "outdoors"), ("rating", "safe")]
+    assert real_tags == [("general", "outdoors"), ("rating", "safe"), ("meta", "real")]
     assert classifier.calls == [(2, 2), (3, 3)]
 
 
@@ -591,3 +599,73 @@ def test_imgutils_domain_classifier_contract_and_missing_dependency(
         assert ANIME_REAL_MODEL_NAME == "mobilenetv3_v1.2_dist"
     finally:
         clear_shared_domain_classifier_cache()
+
+
+def test_anime_pipeline_skips_medium_and_completeness_when_disabled() -> None:
+    class RecordingAnimeBackend(_FakeAnimeBackend):
+        def __init__(self) -> None:
+            super().__init__(
+                general={"1girl": 0.9},
+                rating_scores={"general": 0.9},
+                medium=("illustration", 0.95),
+                completeness=("polished", 0.91),
+            )
+            self.medium_called = False
+            self.completeness_called = False
+
+        def classify_medium(self, image: Image.Image) -> tuple[str, float]:
+            self.medium_called = True
+            return super().classify_medium(image)
+
+        def classify_completeness(self, image: Image.Image) -> tuple[str, float]:
+            self.completeness_called = True
+            return super().classify_completeness(image)
+
+    img = Image.new("RGB", (2, 2))
+
+    backend_no_medium = RecordingAnimeBackend()
+    tags_no_medium = AnimePipeline(
+        AnimePipelineConfig(enable_medium_classification=False),
+        backend_factory=lambda: backend_no_medium,
+    ).predict(img)
+    assert backend_no_medium.medium_called is False
+    assert backend_no_medium.completeness_called is True
+    assert tags_no_medium == [("general", "1girl"), ("rating", "general"), ("meta", "polished")]
+
+    backend_no_completeness = RecordingAnimeBackend()
+    tags_no_completeness = AnimePipeline(
+        AnimePipelineConfig(enable_completeness_classification=False),
+        backend_factory=lambda: backend_no_completeness,
+    ).predict(img)
+    assert backend_no_completeness.medium_called is True
+    assert backend_no_completeness.completeness_called is False
+    assert tags_no_completeness == [
+        ("general", "1girl"),
+        ("rating", "general"),
+        ("meta", "illustration"),
+    ]
+
+
+def test_default_vision_pipeline_omits_domain_tag_when_disabled() -> None:
+    anime_backend = _FakeAnimeBackend(
+        general={"1girl": 0.9},
+        rating_scores={"general": 0.9},
+        medium=("illustration", 0.9),
+        completeness=("polished", 0.9),
+    )
+    real_backend = _FakeRealBackend(
+        rating_scores={"safe": 0.9},
+        general={"portrait": 0.8},
+    )
+    classifier = _FakeDomainClassifier({(2, 2): "anime", (3, 3): "real"})
+    pipeline = DefaultVisionPipeline(
+        PipelinesConfig(enable_domain_tag=False),
+        anime_backend=anime_backend,
+        real_backend=real_backend,
+        domain_classifier=classifier,
+    )
+
+    assert ("meta", "anime") not in pipeline.predict(Image.new("RGB", (2, 2)), "anime")
+    assert ("meta", "real") not in pipeline.predict(Image.new("RGB", (3, 3)), "real")
+    assert ("meta", "anime") not in pipeline.predict(Image.new("RGB", (2, 2)), "auto")
+    assert ("meta", "real") not in pipeline.predict(Image.new("RGB", (3, 3)), "auto")

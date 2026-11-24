@@ -38,6 +38,18 @@ def is_managed_tag(tag_value: str) -> bool:
     return tag_value.startswith(_MANAGED_PREFIXES)
 
 
+def normalize_extra_tag(raw_tag: str) -> str:
+    """Validate and normalize an Album Extra Tag, enforcing Booru format for managed prefixes."""
+    stripped = raw_tag.strip()
+    if not stripped:
+        raise ValueError("extra_tags entries must not be empty")
+
+    category, sep, tag_name = stripped.partition("/")
+    if sep and category.lower() in MANAGED_CATEGORIES:
+        return normalize_booru_tag(category.lower(), tag_name)
+    return stripped
+
+
 def compute_dimension_meta_tags(width: int | None, height: int | None) -> list[str]:
     """Compute deterministic Dimension Meta Tags from original EXIF dimensions."""
     if width is None or height is None or width <= 0 or height <= 0:

@@ -7,11 +7,16 @@ import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeVar
 
 from PIL import Image
 
-from immich_booru_tagger.config import PipelinesConfig, PipelineThresholdConfig, RoutingMode
+from immich_booru_tagger.config import (
+    AnimePipelineConfig,
+    PipelinesConfig,
+    PipelineThresholdConfig,
+    RoutingMode,
+)
 
 PIXAI_MODEL_NAME = "v0.9"
 ANIME_RATING_REPO_ID = "animetimm/mobilenetv3_large_150d.dbv4-full"
@@ -95,11 +100,11 @@ class AnimePipeline:
 
     def __init__(
         self,
-        thresholds: PipelineThresholdConfig | None = None,
+        config: AnimePipelineConfig | None = None,
         *,
         backend_factory: Callable[[], AnimeBackend] | None = None,
     ) -> None:
-        self._thresholds = thresholds or PipelineThresholdConfig()
+        self._config = config or AnimePipelineConfig()
         self._backend_factory = backend_factory or get_shared_anime_backend
         self._backend: AnimeBackend | None = None
 
@@ -115,8 +120,8 @@ class AnimePipeline:
 
         general, character, copyright_tags = backend.extract_pixai(
             image,
-            general_threshold=self._thresholds.general_threshold,
-            character_threshold=self._thresholds.character_threshold,
+            general_threshold=self._config.general_threshold,
+            character_threshold=self._config.character_threshold,
         )
         tags.extend(("general", tag_name) for tag_name in general)
         tags.extend(("character", tag_name) for tag_name in character)
@@ -127,13 +132,15 @@ class AnimePipeline:
         if top_rating is not None:
             tags.append(("rating", top_rating))
 
-        medium_label, _ = backend.classify_medium(image)
-        if medium_label and medium_label != "not_painting":
-            tags.append(("meta", medium_label))
+        if self._config.enable_medium_classification:
+            medium_label, _ = backend.classify_medium(image)
+            if medium_label and medium_label != "not_painting":
+                tags.append(("meta", medium_label))
 
-        completeness_label, _ = backend.classify_completeness(image)
-        if completeness_label:
-            tags.append(("meta", completeness_label))
+        if self._config.enable_completeness_classification:
+            completeness_label, _ = backend.classify_completeness(image)
+            if completeness_label:
+                tags.append(("meta", completeness_label))
 
         return tags
 
@@ -553,20 +560,32 @@ class DefaultVisionPipeline:
             self._domain_classifier = self._domain_classifier_factory()
         return self._domain_classifier
 
+    def _run_domain(
+        self, image: Image.Image, domain: Literal["anime", "real"]
+    ) -> list[tuple[str, str]]:
+        tags = (
+            self._get_anime_pipeline().predict(image)
+            if domain == "anime"
+            else self._get_real_pipeline().predict(image)
+        )
+        if self._config.enable_domain_tag:
+            tags.append(("meta", domain))
+        return tags
+
     def predict(
         self, image: Image.Image, mode: RoutingMode
     ) -> Sequence[tuple[str, str]]:
         """Predict raw (category, tag_name) pairs for a decoded image under RoutingMode."""
         if mode == "anime":
-            return self._get_anime_pipeline().predict(image)
+            return self._run_domain(image, "anime")
         if mode == "real":
-            return self._get_real_pipeline().predict(image)
+            return self._run_domain(image, "real")
         if mode == "auto":
             domain, _ = self._get_domain_classifier().classify_domain(image)
             if domain == "anime":
-                return self._get_anime_pipeline().predict(image)
+                return self._run_domain(image, "anime")
             if domain == "real":
-                return self._get_real_pipeline().predict(image)
+                return self._run_domain(image, "real")
             raise PipelineError(
                 f"Unexpected domain classification label: {domain!r}"
             )

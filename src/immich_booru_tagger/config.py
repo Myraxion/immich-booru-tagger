@@ -11,6 +11,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from immich_booru_tagger.rules import normalize_extra_tag
+
 RoutingMode = Literal["auto", "anime", "real"]
 ThumbnailSize = Literal["preview", "thumbnail"]
 
@@ -63,12 +65,21 @@ class PipelineThresholdConfig(BaseModel):
     character_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
 
 
+class AnimePipelineConfig(PipelineThresholdConfig):
+    """Configuration for the Anime Pipeline thresholds and optional meta classifiers."""
+
+    enable_medium_classification: bool = True
+    enable_completeness_classification: bool = True
+
+
 class PipelinesConfig(BaseModel):
-    """Thresholds grouped by vision pipeline."""
+    """Thresholds and global rule switches grouped by vision pipeline."""
 
     model_config = ConfigDict(extra="forbid")
 
-    anime: PipelineThresholdConfig = Field(default_factory=PipelineThresholdConfig)
+    enable_domain_tag: bool = True
+    enable_dimension_tags: bool = True
+    anime: AnimePipelineConfig = Field(default_factory=AnimePipelineConfig)
     real: PipelineThresholdConfig = Field(default_factory=PipelineThresholdConfig)
 
 
@@ -81,6 +92,12 @@ class AlbumConfig(BaseModel):
     name: str | None = None
     mode: RoutingMode = "auto"
     artist_patterns: list[str] = Field(default_factory=list)
+    extra_tags: list[str] = Field(default_factory=list)
+
+    @field_validator("extra_tags")
+    @classmethod
+    def _validate_extra_tags(cls, tags: list[str]) -> list[str]:
+        return [normalize_extra_tag(tag) for tag in tags]
 
     @field_validator("artist_patterns")
     @classmethod
