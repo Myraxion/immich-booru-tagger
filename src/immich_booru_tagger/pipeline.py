@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generic, Literal, Protocol, TypeVar
 
@@ -23,6 +25,29 @@ ANIME_RATING_REPO_ID = "animetimm/mobilenetv3_large_150d.dbv4-full"
 ANIME_CLASSIFY_MODEL_NAME = "mobilenetv3_v1.3_dist"
 ANIME_COMPLETENESS_MODEL_NAME = "mobilenetv3_v2.2_dist"
 ANIME_REAL_MODEL_NAME = "mobilenetv3_v1.2_dist"
+MAX_INFERENCE_EDGE = 640
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _prepare_inference_image(
+    image: Image.Image, *, max_dimension: int = MAX_INFERENCE_EDGE
+) -> Iterator[Image.Image]:
+    """Normalize image mode to RGB and cap long edge once for downstream models."""
+    needs_resize = max(image.width, image.height) > max_dimension
+    needs_rgb = image.mode != "RGB"
+    if not needs_resize and not needs_rgb:
+        yield image
+        return
+
+    prepared = image.convert("RGB") if needs_rgb else image.copy()
+    try:
+        if needs_resize:
+            prepared.thumbnail((max_dimension, max_dimension), Image.Resampling.BILINEAR)
+        yield prepared
+    finally:
+        prepared.close()
 
 DANBOORU_RATINGS: tuple[str, ...] = (
     "general",
@@ -118,29 +143,30 @@ class AnimePipeline:
         backend = self._get_backend()
         tags: list[tuple[str, str]] = []
 
-        general, character, copyright_tags = backend.extract_pixai(
-            image,
-            general_threshold=self._config.general_threshold,
-            character_threshold=self._config.character_threshold,
-        )
-        tags.extend(("general", tag_name) for tag_name in general)
-        tags.extend(("character", tag_name) for tag_name in character)
-        tags.extend(("copyright", tag_name) for tag_name in copyright_tags)
+        with _prepare_inference_image(image) as prepared:
+            general, character, copyright_tags = backend.extract_pixai(
+                prepared,
+                general_threshold=self._config.general_threshold,
+                character_threshold=self._config.character_threshold,
+            )
+            tags.extend(("general", tag_name) for tag_name in general)
+            tags.extend(("character", tag_name) for tag_name in character)
+            tags.extend(("copyright", tag_name) for tag_name in copyright_tags)
 
-        rating_scores = backend.extract_rating_scores(image)
-        top_rating = _select_top_rating(rating_scores, DANBOORU_RATINGS)
-        if top_rating is not None:
-            tags.append(("rating", top_rating))
+            rating_scores = backend.extract_rating_scores(prepared)
+            top_rating = _select_top_rating(rating_scores, DANBOORU_RATINGS)
+            if top_rating is not None:
+                tags.append(("rating", top_rating))
 
-        if self._config.enable_medium_classification:
-            medium_label, _ = backend.classify_medium(image)
-            if medium_label and medium_label != "not_painting":
-                tags.append(("meta", medium_label))
+            if self._config.enable_medium_classification:
+                medium_label, _ = backend.classify_medium(prepared)
+                if medium_label and medium_label != "not_painting":
+                    tags.append(("meta", medium_label))
 
-        if self._config.enable_completeness_classification:
-            completeness_label, _ = backend.classify_completeness(image)
-            if completeness_label:
-                tags.append(("meta", completeness_label))
+            if self._config.enable_completeness_classification:
+                completeness_label, _ = backend.classify_completeness(prepared)
+                if completeness_label:
+                    tags.append(("meta", completeness_label))
 
         return tags
 
@@ -180,11 +206,12 @@ class RealPipeline:
     def predict(self, image: Image.Image) -> list[tuple[str, str]]:
         """Predict Booru (category, tag_name) pairs for a real-world photo."""
         backend = self._get_backend()
-        rating_scores, general, character = backend.extract_idolsankaku(
-            image,
-            general_threshold=self._thresholds.general_threshold,
-            character_threshold=self._thresholds.character_threshold,
-        )
+        with _prepare_inference_image(image) as prepared:
+            rating_scores, general, character = backend.extract_idolsankaku(
+                prepared,
+                general_threshold=self._thresholds.general_threshold,
+                character_threshold=self._thresholds.character_threshold,
+            )
         tags: list[tuple[str, str]] = []
         tags.extend(("general", tag_name) for tag_name in general)
         tags.extend(("character", tag_name) for tag_name in character)
@@ -258,6 +285,31 @@ def _ensure_hf_token_env() -> None:
 
 
 _DLL_DIR_HANDLES: list[object] = []
+_ONNX_PREPARE_LOCK = threading.Lock()
+_ONNX_RUNTIME_PREPARED = False
+
+
+def _detect_onnx_provider() -> tuple[str | None, list[str]]:
+    available: list[str] = []
+    try:
+        import onnxruntime
+
+        get_available = getattr(onnxruntime, "get_available_providers", None)
+        if callable(get_available):
+            available = [str(p) for p in get_available()]
+    except ImportError:
+        pass
+
+    try:
+        from imgutils.utils.onnxruntime import get_onnx_provider
+
+        return str(get_onnx_provider()), available
+    except Exception:
+        pass
+
+    if "CUDAExecutionProvider" in available:
+        return "CUDAExecutionProvider", available
+    return (available[0] if available else None), available
 
 
 def _preload_onnx_gpu_dlls() -> None:
@@ -296,8 +348,20 @@ def _preload_onnx_gpu_dlls() -> None:
 
 
 def _prepare_onnx_runtime() -> None:
-    _ensure_hf_token_env()
-    _preload_onnx_gpu_dlls()
+    global _ONNX_RUNTIME_PREPARED
+    with _ONNX_PREPARE_LOCK:
+        if _ONNX_RUNTIME_PREPARED:
+            return
+        _ensure_hf_token_env()
+        _preload_onnx_gpu_dlls()
+        provider, available = _detect_onnx_provider()
+        if provider is not None:
+            logger.info(
+                "ONNX Runtime execution provider: %s (available=%s)",
+                provider,
+                available,
+            )
+        _ONNX_RUNTIME_PREPARED = True
 
 
 class ImgutilsAnimeBackend:
@@ -576,17 +640,19 @@ class DefaultVisionPipeline:
         self, image: Image.Image, mode: RoutingMode
     ) -> Sequence[tuple[str, str]]:
         """Predict raw (category, tag_name) pairs for a decoded image under RoutingMode."""
-        if mode == "anime":
-            return self._run_domain(image, "anime")
-        if mode == "real":
-            return self._run_domain(image, "real")
-        if mode == "auto":
-            domain, _ = self._get_domain_classifier().classify_domain(image)
+        if mode not in ("anime", "real", "auto"):
+            raise PipelineError(f"Unsupported routing mode: {mode!r}")
+
+        with _prepare_inference_image(image) as prepared:
+            if mode == "anime":
+                return self._run_domain(prepared, "anime")
+            if mode == "real":
+                return self._run_domain(prepared, "real")
+            domain, _ = self._get_domain_classifier().classify_domain(prepared)
             if domain == "anime":
-                return self._run_domain(image, "anime")
+                return self._run_domain(prepared, "anime")
             if domain == "real":
-                return self._run_domain(image, "real")
+                return self._run_domain(prepared, "real")
             raise PipelineError(
                 f"Unexpected domain classification label: {domain!r}"
             )
-        raise PipelineError(f"Unsupported routing mode: {mode!r}")

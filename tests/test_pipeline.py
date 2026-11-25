@@ -669,3 +669,81 @@ def test_default_vision_pipeline_omits_domain_tag_when_disabled() -> None:
     assert ("meta", "real") not in pipeline.predict(Image.new("RGB", (3, 3)), "real")
     assert ("meta", "anime") not in pipeline.predict(Image.new("RGB", (2, 2)), "auto")
     assert ("meta", "real") not in pipeline.predict(Image.new("RGB", (3, 3)), "auto")
+
+
+def test_default_vision_pipeline_normalizes_rgb_and_resizes_once_for_auto_mode() -> None:
+    seen_images: list[tuple[int, str, tuple[int, int]]] = []
+
+    class RecordingClassifier:
+        def classify_domain(self, image: Image.Image) -> tuple[str, float]:
+            seen_images.append((id(image), image.mode, image.size))
+            return "anime", 0.99
+
+    class RecordingAnimeBackend(_FakeAnimeBackend):
+        def extract_pixai(
+            self,
+            image: Image.Image,
+            *,
+            general_threshold: float,
+            character_threshold: float,
+        ) -> tuple[Mapping[str, float], Mapping[str, float], Mapping[str, float]]:
+            seen_images.append((id(image), image.mode, image.size))
+            return super().extract_pixai(
+                image,
+                general_threshold=general_threshold,
+                character_threshold=character_threshold,
+            )
+
+    pipeline = DefaultVisionPipeline(
+        PipelinesConfig(),
+        anime_backend=RecordingAnimeBackend(
+            general={"1girl": 0.9},
+            rating_scores={"general": 0.9},
+        ),
+        domain_classifier=RecordingClassifier(),
+    )
+
+    source = Image.new("RGBA", (1600, 1200), color=(10, 20, 30, 255))
+    try:
+        pipeline.predict(source, "auto")
+        assert source.mode == "RGBA"
+        assert source.size == (1600, 1200)
+    finally:
+        source.close()
+
+    assert len(seen_images) == 2
+    assert seen_images[0] == seen_images[1]
+    assert seen_images[0][1] == "RGB"
+    assert seen_images[0][2] == (640, 480)
+
+
+def test_prepare_onnx_runtime_runs_once_and_logs_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    import immich_booru_tagger.pipeline as pipeline_mod
+
+    preload_calls = 0
+
+    def fake_preload() -> None:
+        nonlocal preload_calls
+        preload_calls += 1
+
+    fake_ort = ModuleType("onnxruntime")
+    fake_ort.get_available_providers = lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setattr(pipeline_mod, "_ONNX_RUNTIME_PREPARED", False)
+    monkeypatch.setattr(pipeline_mod, "_ensure_hf_token_env", lambda: None)
+    monkeypatch.setattr(pipeline_mod, "_preload_onnx_gpu_dlls", fake_preload)
+
+    caplog.set_level(logging.INFO)
+    pipeline_mod._prepare_onnx_runtime()
+    pipeline_mod._prepare_onnx_runtime()
+
+    assert preload_calls == 1
+    assert any(
+        "CUDAExecutionProvider" in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno == logging.INFO
+    )
