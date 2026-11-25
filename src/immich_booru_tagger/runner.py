@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import io
 import logging
-from collections.abc import Sequence
+from collections import deque
+from collections.abc import Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -87,6 +90,8 @@ class BatchRunner:
             self._config.albums,
             created_after=created_after,
             created_before=created_before,
+            max_eligible=limit,
+            force=force,
         )
         total_scanned, eligible_pairs = self._collect_eligible_assets(
             resolved_albums, force=force
@@ -95,66 +100,129 @@ class BatchRunner:
 
         selected = eligible_pairs[:limit] if limit is not None else eligible_pairs
         batch_size = self._config.batch.size
-        batches = [
-            selected[i : i + batch_size] for i in range(0, len(selected), batch_size)
-        ]
+        total_batches = (len(selected) + batch_size - 1) // batch_size if selected else 0
 
         results: list[AssetTagResult] = []
         skipped_count = 0
-        for batch_index, batch in enumerate(batches, start=1):
-            logger.info(
-                "Processing micro-batch %d/%d (%d assets, dry_run=%s)",
-                batch_index,
-                len(batches),
-                len(batch),
-                dry_run,
-            )
+        with self._prefetch_thumbnails(selected, batch_size=batch_size) as prefetched:
+            batch_index = 0
             batch_updates: list[tuple[ImmichAsset, list[str]]] = []
             log_prefix = "[dry-run] " if dry_run else ""
-            for album, asset in batch:
-                image = self._load_thumbnail_image(asset)
-                if image is None:
-                    skipped_count += 1
-                    continue
-                try:
-                    tags = self._compute_asset_tags(asset, image, album)
-                finally:
-                    image.close()
 
-                logger.info(
-                    "%sasset=%s (%s) album=%s mode=%s tags=%s",
-                    log_prefix,
-                    asset.id,
-                    asset.original_file_name,
-                    album.name,
-                    album.mode,
-                    tags,
-                )
-                batch_updates.append((asset, tags))
-                results.append(
-                    AssetTagResult(
-                        asset_id=asset.id,
-                        file_name=asset.original_file_name,
-                        album_id=album.id,
-                        album_name=album.name,
-                        mode=album.mode,
-                        tags=tags,
+            for idx, (album, asset, image) in enumerate(prefetched):
+                if idx % batch_size == 0:
+                    batch_index += 1
+                    remaining = min(batch_size, len(selected) - idx)
+                    logger.info(
+                        "Processing micro-batch %d/%d (%d assets, dry_run=%s)",
+                        batch_index,
+                        total_batches,
+                        remaining,
+                        dry_run,
                     )
-                )
 
-            if not dry_run and batch_updates:
-                self._client.sync_batch_tags(batch_updates, force=force)
+                if image is not None:
+                    try:
+                        tags = self._compute_asset_tags(asset, image, album)
+                    finally:
+                        image.close()
+
+                    logger.info(
+                        "%sasset=%s (%s) album=%s mode=%s tags=%s",
+                        log_prefix,
+                        asset.id,
+                        asset.original_file_name,
+                        album.name,
+                        album.mode,
+                        tags,
+                    )
+                    batch_updates.append((asset, tags))
+                    results.append(
+                        AssetTagResult(
+                            asset_id=asset.id,
+                            file_name=asset.original_file_name,
+                            album_id=album.id,
+                            album_name=album.name,
+                            mode=album.mode,
+                            tags=tags,
+                        )
+                    )
+                else:
+                    skipped_count += 1
+
+                is_batch_end = (idx + 1) % batch_size == 0 or idx + 1 == len(selected)
+                if is_batch_end and batch_updates:
+                    if not dry_run:
+                        self._client.sync_batch_tags(batch_updates, force=force)
+                    batch_updates = []
 
         return RunSummary(
             albums_resolved=len(resolved_albums),
             total_assets_scanned=total_scanned,
             total_eligible=total_eligible,
             processed_count=len(results),
-            batches_count=len(batches),
+            batches_count=total_batches,
             dry_run=dry_run,
             results=results,
             skipped_count=skipped_count,
         )
+
+    @contextmanager
+    def _prefetch_thumbnails(
+        self,
+        selected: Sequence[tuple[TargetAlbum, ImmichAsset]],
+        *,
+        batch_size: int,
+    ) -> Iterator[Iterator[tuple[TargetAlbum, ImmichAsset, Image.Image | None]]]:
+        if not selected:
+            yield iter(())
+            return
+
+        if len(selected) == 1:
+            album, asset = selected[0]
+            yield iter(((album, asset, self._load_thumbnail_image(asset)),))
+            return
+
+        window_size = min(max(batch_size, 4), 16, len(selected))
+        max_workers = min(4, len(selected))
+        pending: deque[tuple[TargetAlbum, ImmichAsset, Future[Image.Image | None]]] = deque()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            next_idx = 0
+            while next_idx < window_size:
+                album, asset = selected[next_idx]
+                pending.append(
+                    (album, asset, executor.submit(self._load_thumbnail_image, asset))
+                )
+                next_idx += 1
+
+            def _iter_items() -> Iterator[tuple[TargetAlbum, ImmichAsset, Image.Image | None]]:
+                nonlocal next_idx
+                while pending:
+                    album, asset, future = pending.popleft()
+                    if next_idx < len(selected):
+                        next_album, next_asset = selected[next_idx]
+                        pending.append(
+                            (
+                                next_album,
+                                next_asset,
+                                executor.submit(self._load_thumbnail_image, next_asset),
+                            )
+                        )
+                        next_idx += 1
+                    yield album, asset, future.result()
+
+            try:
+                yield _iter_items()
+            finally:
+                for _, _, future in pending:
+                    if not future.cancel():
+                        try:
+                            leftover = future.result()
+                        except Exception:
+                            leftover = None
+                        if leftover is not None:
+                            leftover.close()
 
     def _load_thumbnail_image(self, asset: ImmichAsset) -> Image.Image | None:
         try:

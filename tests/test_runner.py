@@ -167,7 +167,7 @@ def test_batch_runner_applies_limit_and_force_flags() -> None:
         runner = BatchRunner(config=config, client=client)
         summary = runner.run(dry_run=True, limit=2, force=True)
 
-    assert summary.total_eligible == 4
+    assert summary.total_eligible == 2
     assert summary.processed_count == 2
     assert summary.batches_count == 1
     assert [result.asset_id for result in summary.results] == ["img-tagged", "img-1"]
@@ -1280,3 +1280,119 @@ def test_batch_runner_attaches_album_extra_tags_and_skips_dimension_tags_when_di
     assert tagged_assets[tag_ids["meta/pixiv_art"]] == ["a-1"]
     assert tagged_assets[tag_ids["source/Pixiv"]] == ["a-1"]
     assert tagged_assets[tag_ids["精选"]] == ["a-1"]
+
+
+def test_batch_runner_prefetches_thumbnails_concurrently_with_inference() -> None:
+    import threading
+
+    barrier = threading.Barrier(2, timeout=1.0)
+    predicted_ids: list[str] = []
+
+    class BarrierVisionPipeline:
+        def predict(
+            self, image: Image.Image, mode: RoutingMode
+        ) -> Sequence[tuple[str, str]]:
+            predicted_ids.append(f"{image.width}x{image.height}")
+            if len(predicted_ids) == 1:
+                barrier.wait()
+            return [("general", "1girl")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/alb-prefetch":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-prefetch",
+                    "albumName": "Prefetch",
+                    "assets": [
+                        {"id": "a-1", "type": "IMAGE", "originalFileName": "1.png", "tags": []},
+                        {"id": "a-2", "type": "IMAGE", "originalFileName": "2.png", "tags": []},
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/a-1/thumbnail":
+            return httpx.Response(200, content=_png_bytes(1, 1))
+        if request.method == "GET" and request.url.path == "/api/assets/a-2/thumbnail":
+            barrier.wait()
+            return httpx.Response(200, content=_png_bytes(2, 2))
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        batch=BatchConfig(size=2),
+        albums=[AlbumConfig(id="alb-prefetch", mode="anime")],
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        summary = BatchRunner(
+            config=config, client=client, vision_pipeline=BarrierVisionPipeline()
+        ).run(dry_run=True)
+
+    assert [r.asset_id for r in summary.results] == ["a-1", "a-2"]
+    assert predicted_ids == ["1x1", "2x2"]
+
+
+def test_batch_runner_closes_prefetched_images_on_fast_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    closed_ids: list[str] = []
+    prefetched_ready = threading.Event()
+
+    class TrackingPipeline:
+        def predict(
+            self, image: Image.Image, mode: RoutingMode
+        ) -> Sequence[tuple[str, str]]:
+            prefetched_ready.wait(timeout=1.0)
+            raise RuntimeError("inference boom")
+
+    orig_open = Image.open
+
+    def tracking_open(fp: object, *args: object, **kwargs: object) -> Image.Image:
+        img = orig_open(fp, *args, **kwargs)  # type: ignore[arg-type]
+        orig_close = img.close
+        tag = f"{img.width}x{img.height}"
+
+        def wrapped_close() -> None:
+            closed_ids.append(tag)
+            orig_close()
+
+        img.close = wrapped_close  # type: ignore[method-assign]
+        return img
+
+    monkeypatch.setattr(Image, "open", tracking_open)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/alb-err":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-err",
+                    "albumName": "Err",
+                    "assets": [
+                        {"id": "a-1", "type": "IMAGE", "originalFileName": "1.png", "tags": []},
+                        {"id": "a-2", "type": "IMAGE", "originalFileName": "2.png", "tags": []},
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/a-1/thumbnail":
+            return httpx.Response(200, content=_png_bytes(1, 1))
+        if request.method == "GET" and request.url.path == "/api/assets/a-2/thumbnail":
+            prefetched_ready.set()
+            return httpx.Response(200, content=_png_bytes(2, 2))
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        batch=BatchConfig(size=2),
+        albums=[AlbumConfig(id="alb-err", mode="anime")],
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError, match="inference boom"):
+            BatchRunner(
+                config=config, client=client, vision_pipeline=TrackingPipeline()
+            ).run(dry_run=True)
+
+    assert set(closed_ids) == {"1x1", "2x2"}

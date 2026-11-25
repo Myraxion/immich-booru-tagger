@@ -739,3 +739,67 @@ def test_sync_batch_tags_fast_fails_without_marking_processed_when_bulk_tag_fail
             client.sync_batch_tags(assets)
 
     assert marker_called is False
+
+
+def test_resolve_target_albums_stops_early_when_max_eligible_reached() -> None:
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(f"{request.method} {request.url.path}")
+        if request.method == "GET" and request.url.path == "/api/albums/album-1":
+            return _json_response(
+                200,
+                {"id": "album-1", "albumName": "Album 1", "assetCount": 10},
+            )
+        if request.method == "POST" and request.url.path == "/api/search/metadata":
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["page"] == 1
+            return _json_response(
+                200,
+                {
+                    "assets": {
+                        "items": [
+                            {
+                                "id": "a-1",
+                                "type": "IMAGE",
+                                "originalFileName": "tagged.png",
+                                "tags": [{"id": "t-1", "value": "meta/booru_tagged"}],
+                            },
+                            {
+                                "id": "a-2",
+                                "type": "IMAGE",
+                                "originalFileName": "need.png",
+                            },
+                            {
+                                "id": "a-3",
+                                "type": "IMAGE",
+                                "originalFileName": "extra.png",
+                            },
+                        ],
+                        "nextPage": "2",
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/api/assets/a-2":
+            return _json_response(
+                200,
+                {"id": "a-2", "type": "IMAGE", "originalFileName": "need.png", "tags": []},
+            )
+        return _json_response(500, {"message": f"Unexpected request: {request.url.path}"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        albums = client.resolve_target_albums(
+            [AlbumConfig(id="album-1"), AlbumConfig(id="album-2")],
+            max_eligible=1,
+            force=False,
+        )
+
+    assert len(albums) == 1
+    assert [asset.id for asset in albums[0].assets if asset.id == "a-2"] == ["a-2"]
+    assert "GET /api/assets/a-3" not in seen_paths
+    assert "GET /api/albums/album-2" not in seen_paths
+    assert seen_paths.count("POST /api/search/metadata") == 1

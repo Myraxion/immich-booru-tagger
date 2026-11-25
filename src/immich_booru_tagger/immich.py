@@ -228,12 +228,19 @@ class ImmichClient:
         *,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
+        max_eligible: int | None = None,
+        force: bool = False,
     ) -> list[TargetAlbum]:
         """Resolve all configured Target Albums into concrete TargetAlbum objects."""
         all_albums: list[_AlbumSummaryPayload] | None = None
         resolved: list[TargetAlbum] = []
+        seen_asset_ids: set[str] = set()
+        eligible_count = 0
 
         for album_cfg in album_configs:
+            if max_eligible is not None and eligible_count >= max_eligible:
+                break
+
             if album_cfg.id is not None:
                 album_id = album_cfg.id
             else:
@@ -243,37 +250,43 @@ class ImmichClient:
                 album_id = self._match_album_by_name(all_albums, album_cfg.name)
 
             detail = self._get_album_detail(album_id)
-            raw_assets = (
-                detail.assets
+            asset_chunks = (
+                [detail.assets]
                 if detail.assets or detail.asset_count == 0
-                else self._search_album_assets(
+                else self._iter_album_asset_pages(
                     album_id,
                     created_after=created_after,
                     created_before=created_before,
                 )
             )
-            filtered_assets = [
-                asset
-                for asset in raw_assets
-                if _within_created_at_range(asset, created_after, created_before)
-            ]
-            enrich_indices = [
-                idx
-                for idx, asset in enumerate(filtered_assets)
-                if asset.type == "IMAGE" and not asset.tags_present
-            ]
-            enriched_assets = list(filtered_assets)
-            if enrich_indices:
-                enriched_subset = self._map_concurrently(
-                    self._enrich_asset_tags_if_missing,
-                    [filtered_assets[idx] for idx in enrich_indices],
-                )
-                for idx, enriched in zip(enrich_indices, enriched_subset, strict=True):
-                    enriched_assets[idx] = enriched
-            for asset in enriched_assets:
+            album_assets: list[ImmichAsset] = []
+
+            for chunk in asset_chunks:
+                filtered_assets = [
+                    asset
+                    for asset in chunk
+                    if _within_created_at_range(asset, created_after, created_before)
+                ]
+                if max_eligible is None:
+                    enriched_assets = self._enrich_missing_assets(filtered_assets)
+                    album_assets.extend(enriched_assets)
+                else:
+                    enriched_assets, eligible_count = self._enrich_until_limit(
+                        filtered_assets,
+                        seen_asset_ids=seen_asset_ids,
+                        eligible_count=eligible_count,
+                        max_eligible=max_eligible,
+                        force=force,
+                    )
+                    album_assets.extend(enriched_assets)
+                    if eligible_count >= max_eligible:
+                        break
+
+            for asset in album_assets:
                 for tag in asset.tags:
                     if tag.id and tag.value:
                         self._tag_cache.setdefault(tag.value, tag.id)
+
             resolved.append(
                 TargetAlbum(
                     id=detail.id,
@@ -281,20 +294,98 @@ class ImmichClient:
                     mode=album_cfg.mode,
                     artist_patterns=album_cfg.artist_patterns,
                     extra_tags=album_cfg.extra_tags,
-                    assets=enriched_assets,
+                    assets=album_assets,
                 )
             )
 
         return resolved
 
-    def _search_album_assets(
+    def _enrich_missing_assets(
+        self, assets: Sequence[ImmichAsset]
+    ) -> list[ImmichAsset]:
+        enrich_indices = [
+            idx
+            for idx, asset in enumerate(assets)
+            if asset.type == "IMAGE" and not asset.tags_present
+        ]
+        enriched_assets = list(assets)
+        if enrich_indices:
+            enriched_subset = self._map_concurrently(
+                self._enrich_asset_tags_if_missing,
+                [assets[idx] for idx in enrich_indices],
+            )
+            for idx, enriched in zip(enrich_indices, enriched_subset, strict=True):
+                enriched_assets[idx] = enriched
+        return enriched_assets
+
+    def _enrich_until_limit(
+        self,
+        assets: Sequence[ImmichAsset],
+        *,
+        seen_asset_ids: set[str],
+        eligible_count: int,
+        max_eligible: int,
+        force: bool,
+    ) -> tuple[list[ImmichAsset], int]:
+        collected: list[ImmichAsset] = []
+
+        def _record(resolved_asset: ImmichAsset) -> bool:
+            nonlocal eligible_count
+            if resolved_asset.id in seen_asset_ids:
+                collected.append(resolved_asset)
+                return False
+            seen_asset_ids.add(resolved_asset.id)
+            collected.append(resolved_asset)
+            if resolved_asset.type == "IMAGE" and (
+                force or PROCESSED_MARKER not in resolved_asset.tag_values
+            ):
+                eligible_count += 1
+            return eligible_count >= max_eligible
+
+        idx = 0
+        while idx < len(assets) and eligible_count < max_eligible:
+            asset = assets[idx]
+            if asset.id in seen_asset_ids or asset.type != "IMAGE" or asset.tags_present:
+                _record(asset)
+                idx += 1
+                continue
+
+            # Enrich a bounded batch of unknown-tag images to find remaining eligible ones.
+            remaining = max_eligible - eligible_count
+            batch_end = idx
+            pending_indices: list[int] = []
+            while batch_end < len(assets) and len(pending_indices) < min(
+                remaining, self._max_concurrency
+            ):
+                candidate = assets[batch_end]
+                if (
+                    candidate.id not in seen_asset_ids
+                    and candidate.type == "IMAGE"
+                    and not candidate.tags_present
+                ):
+                    pending_indices.append(batch_end)
+                batch_end += 1
+
+            enriched_subset = self._map_concurrently(
+                self._enrich_asset_tags_if_missing,
+                [assets[i] for i in pending_indices],
+            )
+            enriched_by_idx = dict(zip(pending_indices, enriched_subset, strict=True))
+
+            for pos in range(idx, batch_end):
+                if _record(enriched_by_idx.get(pos, assets[pos])):
+                    break
+            idx = batch_end
+
+        return collected, eligible_count
+
+    def _iter_album_asset_pages(
         self,
         album_id: str,
         *,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
-    ) -> list[ImmichAsset]:
-        assets: list[ImmichAsset] = []
+    ) -> Sequence[list[ImmichAsset]] | Any:
         page = 1
         while True:
             search_body: dict[str, Any] = {
@@ -322,14 +413,12 @@ class ImmichClient:
             items = assets_section.get("items") or []
             if not isinstance(items, list):
                 raise ImmichApiError("Expected 'assets.items' list from POST /api/search/metadata")
-            assets.extend(ImmichAsset.model_validate(item) for item in items)
+            yield [ImmichAsset.model_validate(item) for item in items]
 
             next_page = assets_section.get("nextPage")
             if not next_page:
                 break
             page = int(next_page)
-
-        return assets
 
     def _enrich_asset_tags_if_missing(self, asset: ImmichAsset) -> ImmichAsset:
         if asset.type != "IMAGE" or asset.tags_present:
