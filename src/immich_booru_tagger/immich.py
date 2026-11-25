@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from types import TracebackType
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -126,7 +127,12 @@ class TargetAlbum(BaseModel):
     assets: list[ImmichAsset]
 
 
-def _append_unique(mapping: dict[str, list[str]], key: str, value: str) -> None:
+_KeyT = TypeVar("_KeyT")
+_ItemT = TypeVar("_ItemT")
+_ResultT = TypeVar("_ResultT")
+
+
+def _append_unique(mapping: dict[_KeyT, list[str]], key: _KeyT, value: str) -> None:
     bucket = mapping.setdefault(key, [])
     if value not in bucket:
         bucket.append(value)
@@ -162,11 +168,14 @@ class ImmichClient:
         api_key: str,
         *,
         timeout: float = 30.0,
+        max_concurrency: int = 8,
         transport: httpx.BaseTransport | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         self._owns_client = client is None
+        self._max_concurrency = max(1, max_concurrency)
         self._tag_cache: dict[str, str] = {}
+        pool_size = max(16, self._max_concurrency * 2)
         self._client = (
             client
             if client is not None
@@ -174,6 +183,10 @@ class ImmichClient:
                 base_url=base_url.rstrip("/"),
                 headers={"x-api-key": api_key},
                 timeout=timeout,
+                limits=httpx.Limits(
+                    max_connections=pool_size,
+                    max_keepalive_connections=pool_size,
+                ),
                 transport=transport,
             )
         )
@@ -244,9 +257,23 @@ class ImmichClient:
                 for asset in raw_assets
                 if _within_created_at_range(asset, created_after, created_before)
             ]
-            enriched_assets = [
-                self._enrich_asset_tags_if_missing(asset) for asset in filtered_assets
+            enrich_indices = [
+                idx
+                for idx, asset in enumerate(filtered_assets)
+                if asset.type == "IMAGE" and not asset.tags_present
             ]
+            enriched_assets = list(filtered_assets)
+            if enrich_indices:
+                enriched_subset = self._map_concurrently(
+                    self._enrich_asset_tags_if_missing,
+                    [filtered_assets[idx] for idx in enrich_indices],
+                )
+                for idx, enriched in zip(enrich_indices, enriched_subset, strict=True):
+                    enriched_assets[idx] = enriched
+            for asset in enriched_assets:
+                for tag in asset.tags:
+                    if tag.id and tag.value:
+                        self._tag_cache.setdefault(tag.value, tag.id)
             resolved.append(
                 TargetAlbum(
                     id=detail.id,
@@ -272,6 +299,7 @@ class ImmichClient:
         while True:
             search_body: dict[str, Any] = {
                 "albumIds": [album_id],
+                "type": "IMAGE",
                 "page": page,
                 "size": 250,
                 "withExif": True,
@@ -356,6 +384,18 @@ class ImmichClient:
             return
         self._request_json("PUT", f"/api/tags/{tag_id}/assets", json={"ids": list(asset_ids)})
 
+    def bulk_tag_assets(
+        self, asset_ids: Sequence[str], tag_ids: Sequence[str]
+    ) -> None:
+        """Attach multiple tag IDs to multiple asset IDs in a single request."""
+        if not asset_ids or not tag_ids:
+            return
+        self._request_json(
+            "PUT",
+            "/api/tags/assets",
+            json={"assetIds": list(asset_ids), "tagIds": list(tag_ids)},
+        )
+
     def untag_assets(self, tag_id: str, asset_ids: Sequence[str]) -> None:
         """Detach an existing tag ID from the given asset IDs."""
         if not asset_ids:
@@ -375,21 +415,39 @@ class ImmichClient:
         if force:
             self._unbind_managed_tags([asset for asset, _ in batch_updates])
 
-        assets_by_tag: dict[str, list[str]] = {}
         all_asset_ids: list[str] = []
+        unique_tags: list[str] = []
+        seen_tags: set[str] = set()
+        asset_tag_values: dict[str, list[str]] = {}
+
         for asset, tags in batch_updates:
-            if asset.id not in all_asset_ids:
+            if asset.id not in asset_tag_values:
                 all_asset_ids.append(asset.id)
+                asset_tag_values[asset.id] = []
             for tag_value in dict.fromkeys(tags):
                 if tag_value == PROCESSED_MARKER:
                     continue
-                _append_unique(assets_by_tag, tag_value, asset.id)
+                if tag_value not in seen_tags:
+                    seen_tags.add(tag_value)
+                    unique_tags.append(tag_value)
+                if tag_value not in asset_tag_values[asset.id]:
+                    asset_tag_values[asset.id].append(tag_value)
 
-        tags_to_ensure = [*assets_by_tag.keys(), PROCESSED_MARKER]
+        tags_to_ensure = [*unique_tags, PROCESSED_MARKER]
         tag_id_map = self.ensure_tags(tags_to_ensure)
 
-        for tag_value, asset_ids in assets_by_tag.items():
-            self.tag_assets(tag_id_map[tag_value], asset_ids)
+        assets_by_tag_set: dict[tuple[str, ...], list[str]] = {}
+        for asset_id in all_asset_ids:
+            tag_ids = tuple(
+                sorted(tag_id_map[value] for value in asset_tag_values[asset_id])
+            )
+            if tag_ids:
+                _append_unique(assets_by_tag_set, tag_ids, asset_id)
+
+        self._map_concurrently(
+            lambda pair: self.bulk_tag_assets(pair[1], pair[0]),
+            list(assets_by_tag_set.items()),
+        )
 
         self.tag_assets(tag_id_map[PROCESSED_MARKER], all_asset_ids)
 
@@ -411,8 +469,20 @@ class ImmichClient:
             tag_id = tag.id or resolved_ids[tag.value]
             _append_unique(assets_by_tag_id, tag_id, asset_id)
 
-        for tag_id, asset_ids in assets_by_tag_id.items():
-            self.untag_assets(tag_id, asset_ids)
+        self._map_concurrently(
+            lambda pair: self.untag_assets(pair[0], pair[1]),
+            list(assets_by_tag_id.items()),
+        )
+
+    def _map_concurrently(
+        self, fn: Callable[[_ItemT], _ResultT], items: Sequence[_ItemT]
+    ) -> list[_ResultT]:
+        if len(items) > 1 and self._max_concurrency > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(self._max_concurrency, len(items))
+            ) as executor:
+                return list(executor.map(fn, items))
+        return [fn(item) for item in items]
 
     def _list_albums(self) -> list[_AlbumSummaryPayload]:
         payload = self._request_json("GET", "/api/albums")

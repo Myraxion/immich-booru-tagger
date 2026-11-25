@@ -272,39 +272,43 @@ def test_batch_runner_writes_back_per_micro_batch_reusing_tag_cache() -> None:
     assert summary.batches_count == 2
 
     # First micro-batch: img-1 & img-2; second micro-batch: img-3
+    # meta/booru_tagged is pre-warmed as "t-1" from img-tagged in album resolution
     id_1girl = tag_registry["general/1girl"]
     id_absurdres = tag_registry["meta/absurdres"]
     id_lowres = tag_registry["meta/lowres"]
     id_tall = tag_registry["meta/tall_image"]
     id_safe = tag_registry["rating/safe"]
-    id_marker = tag_registry["meta/booru_tagged"]
 
-    assert write_events == [
-        # Micro-batch 1: upsert all unknown tags including PROCESSED_MARKER
-        (
-            "PUT",
-            "/api/tags",
-            {
-                "tags": [
-                    "general/1girl",
-                    "meta/absurdres",
-                    "meta/lowres",
-                    "meta/tall_image",
-                    "meta/booru_tagged",
-                ]
-            },
-        ),
-        ("PUT", f"/api/tags/{id_1girl}/assets", {"ids": ["img-1", "img-2"]}),
-        ("PUT", f"/api/tags/{id_absurdres}/assets", {"ids": ["img-1"]}),
-        ("PUT", f"/api/tags/{id_lowres}/assets", {"ids": ["img-2"]}),
-        ("PUT", f"/api/tags/{id_tall}/assets", {"ids": ["img-2"]}),
-        ("PUT", f"/api/tags/{id_marker}/assets", {"ids": ["img-1", "img-2"]}),
-        # Micro-batch 2: only unknown rating/safe is upserted; 1girl & marker hit cache
-        ("PUT", "/api/tags", {"tags": ["rating/safe"]}),
-        ("PUT", f"/api/tags/{id_1girl}/assets", {"ids": ["img-3"]}),
-        ("PUT", f"/api/tags/{id_safe}/assets", {"ids": ["img-3"]}),
-        ("PUT", f"/api/tags/{id_marker}/assets", {"ids": ["img-3"]}),
-    ]
+    assert write_events[0] == (
+        "PUT",
+        "/api/tags",
+        {
+            "tags": [
+                "general/1girl",
+                "meta/absurdres",
+                "meta/lowres",
+                "meta/tall_image",
+            ]
+        },
+    )
+    batch1_bulk = write_events[1:3]
+    assert {
+        (method, path, tuple(body["assetIds"]), frozenset(body["tagIds"]))  # type: ignore[index]
+        for method, path, body in batch1_bulk
+    } == {
+        ("PUT", "/api/tags/assets", ("img-1",), frozenset({id_1girl, id_absurdres})),
+        ("PUT", "/api/tags/assets", ("img-2",), frozenset({id_1girl, id_lowres, id_tall})),
+    }
+    assert write_events[3] == (
+        "PUT",
+        "/api/tags/t-1/assets",
+        {"ids": ["img-1", "img-2"]},
+    )
+    assert write_events[4] == ("PUT", "/api/tags", {"tags": ["rating/safe"]})
+    assert write_events[5][0:2] == ("PUT", "/api/tags/assets")
+    assert write_events[5][2]["assetIds"] == ["img-3"]  # type: ignore[index]
+    assert set(write_events[5][2]["tagIds"]) == {id_1girl, id_safe}  # type: ignore[index]
+    assert write_events[6] == ("PUT", "/api/tags/t-1/assets", {"ids": ["img-3"]})
 
 
 def test_batch_runner_force_mode_unbinds_only_managed_old_tags_and_preserves_personal_tags() -> None:
@@ -393,12 +397,15 @@ def test_batch_runner_force_mode_unbinds_only_managed_old_tags_and_preserves_per
     put_calls = [e for e in events if e[0] == "PUT"]
 
     # Must detach managed tags only; personal tags (user-1, user-2, user-3) must NEVER be touched
-    assert delete_calls == [
-        ("DELETE", "/api/tags/old-marker/assets", {"ids": ["a-1"]}),
-        ("DELETE", "/api/tags/old-gen/assets", {"ids": ["a-1", "a-2"]}),
-        ("DELETE", "/api/tags/resolved-artist/assets", {"ids": ["a-1"]}),
-        ("DELETE", "/api/tags/old-rating/assets", {"ids": ["a-2"]}),
-    ]
+    assert {
+        (method, path, tuple(body["ids"]))  # type: ignore[index]
+        for method, path, body in delete_calls
+    } == {
+        ("DELETE", "/api/tags/old-marker/assets", ("a-1",)),
+        ("DELETE", "/api/tags/old-gen/assets", ("a-1", "a-2")),
+        ("DELETE", "/api/tags/resolved-artist/assets", ("a-1",)),
+        ("DELETE", "/api/tags/old-rating/assets", ("a-2",)),
+    }
     deleted_paths = {path for _, path, _ in delete_calls}
     assert "/api/tags/user-1/assets" not in deleted_paths
     assert "/api/tags/user-2/assets" not in deleted_paths
@@ -412,7 +419,7 @@ def test_batch_runner_force_mode_unbinds_only_managed_old_tags_and_preserves_per
     assert last_delete_idx < first_attach_idx
     assert put_calls[-1] == (
         "PUT",
-        "/api/tags/new-marker/assets",
+        "/api/tags/old-marker/assets",
         {"ids": ["a-1", "a-2"]},
     )
 
@@ -595,8 +602,7 @@ def test_batch_runner_skips_missing_or_corrupt_thumbnails_with_warning_and_write
     # Only img-ok receives tags and meta/booru_tagged
     assert write_events == [
         ("PUT", "/api/tags", {"tags": ["general/1girl", "meta/absurdres", "meta/booru_tagged"]}),
-        ("PUT", "/api/tags/t-0/assets", {"ids": ["img-ok"]}),
-        ("PUT", "/api/tags/t-1/assets", {"ids": ["img-ok"]}),
+        ("PUT", "/api/tags/assets", {"assetIds": ["img-ok"], "tagIds": ["t-0", "t-1"]}),
         ("PUT", "/api/tags/t-2/assets", {"ids": ["img-ok"]}),
     ]
 
@@ -1163,6 +1169,11 @@ def test_batch_runner_extracts_artist_tag_from_album_patterns_and_persists_to_im
                 tag_id = tag_ids.setdefault(value, f"tid-{len(tag_ids) + 1}")
                 response_items.append({"id": tag_id, "value": value})
             return _json_response(200, response_items)
+        if request.method == "PUT" and request.url.path == "/api/tags/assets":
+            body = json.loads(request.content.decode("utf-8"))
+            for tag_id in body["tagIds"]:
+                tagged_assets.setdefault(tag_id, []).extend(body["assetIds"])
+            return httpx.Response(status_code=204)
         if request.method == "PUT" and request.url.path.startswith("/api/tags/") and request.url.path.endswith("/assets"):
             tag_id = request.url.path.split("/")[3]
             body = json.loads(request.content.decode("utf-8"))
@@ -1201,7 +1212,7 @@ def test_batch_runner_extracts_artist_tag_from_album_patterns_and_persists_to_im
 def test_batch_runner_attaches_album_extra_tags_and_skips_dimension_tags_when_disabled() -> None:
     delete_paths: list[str] = []
     tagged_assets: dict[str, list[str]] = {}
-    tag_ids: dict[str, str] = {}
+    tag_ids: dict[str, str] = {"source/Pixiv": "free-src"}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/api/albums/alb-extra":
@@ -1236,6 +1247,11 @@ def test_batch_runner_attaches_album_extra_tags_and_skips_dimension_tags_when_di
                 tid = tag_ids.setdefault(value, f"tid-{len(tag_ids) + 1}")
                 items.append({"id": tid, "value": value})
             return _json_response(200, items)
+        if request.method == "PUT" and request.url.path == "/api/tags/assets":
+            body = json.loads(request.content.decode("utf-8"))
+            for tag_id in body["tagIds"]:
+                tagged_assets.setdefault(tag_id, []).extend(body["assetIds"])
+            return httpx.Response(status_code=204)
         if request.method == "PUT" and request.url.path.endswith("/assets"):
             tag_id = request.url.path.split("/")[3]
             body = json.loads(request.content.decode("utf-8"))

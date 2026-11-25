@@ -356,6 +356,7 @@ def test_resolve_target_album_falls_back_to_metadata_search_with_pagination() ->
             page = body["page"]
             seen_pages.append(page)
             assert body["albumIds"] == ["album-v3"]
+            assert body["type"] == "IMAGE"
             assert body["withExif"] is True
             if page == 1:
                 return _json_response(
@@ -559,3 +560,182 @@ def test_resolve_target_album_passes_time_bounds_to_metadata_search_fallback() -
     assert seen_bodies[0]["createdAfter"] == "2026-01-01T00:00:00Z"
     assert seen_bodies[0]["createdBefore"] == "2026-11-01T00:00:00Z"
     assert [asset.id for asset in albums[0].assets] == ["a-1"]
+
+
+def test_resolve_target_album_warms_tag_cache_from_existing_asset_tags() -> None:
+    upsert_calls: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-1":
+            return _json_response(
+                200,
+                {
+                    "id": "album-1",
+                    "albumName": "CachedAlbum",
+                    "assets": [
+                        {
+                            "id": "a-1",
+                            "type": "IMAGE",
+                            "originalFileName": "p1.png",
+                            "tags": [
+                                {"id": "tid-marker", "value": "meta/booru_tagged"},
+                                {"id": "", "value": "general/no_id"},
+                            ],
+                        }
+                    ],
+                },
+            )
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            upsert_calls.append(body["tags"])
+            return _json_response(
+                200,
+                [{"id": f"new-{tag}", "value": tag} for tag in body["tags"]],
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        client.resolve_target_albums([AlbumConfig(id="album-1")])
+        resolved = client.ensure_tags(["meta/booru_tagged", "general/no_id"])
+
+    assert resolved == {
+        "meta/booru_tagged": "tid-marker",
+        "general/no_id": "new-general/no_id",
+    }
+    assert upsert_calls == [["general/no_id"]]
+
+
+def test_resolve_target_album_enriches_missing_tags_concurrently_preserving_order() -> None:
+    import threading
+
+    barrier = threading.Barrier(2, timeout=1.0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/albums/album-1":
+            return _json_response(
+                200,
+                {
+                    "id": "album-1",
+                    "albumName": "ConcurrentAlbum",
+                    "assets": [
+                        {"id": "a-1", "type": "IMAGE", "originalFileName": "1.png"},
+                        {"id": "a-2", "type": "IMAGE", "originalFileName": "2.png"},
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path.startswith("/api/assets/"):
+            asset_id = request.url.path.rsplit("/", 1)[-1]
+            barrier.wait()
+            return _json_response(
+                200,
+                {
+                    "id": asset_id,
+                    "type": "IMAGE",
+                    "originalFileName": f"{asset_id}.png",
+                    "tags": [{"id": f"t-{asset_id}", "value": f"general/{asset_id}"}],
+                },
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        albums = client.resolve_target_albums([AlbumConfig(id="album-1")])
+
+    assert [asset.id for asset in albums[0].assets] == ["a-1", "a-2"]
+    assert albums[0].assets[0].tag_values == {"general/a-1"}
+    assert albums[0].assets[1].tag_values == {"general/a-2"}
+
+
+def test_sync_batch_tags_uses_bulk_endpoint_concurrently_and_marks_processed_last() -> None:
+    import threading
+    from immich_booru_tagger.immich import ImmichAsset
+
+    barrier = threading.Barrier(2, timeout=1.0)
+    events: list[tuple[str, str, object]] = []
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        with lock:
+            events.append((request.method, request.url.path, body))
+
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            assert isinstance(body, dict)
+            return _json_response(
+                200,
+                [{"id": f"id-{tag}", "value": tag} for tag in body["tags"]],
+            )
+        if request.method == "PUT" and request.url.path == "/api/tags/assets":
+            barrier.wait()
+            return httpx.Response(status_code=204)
+        if request.method == "PUT" and request.url.path.endswith("/assets"):
+            return httpx.Response(status_code=204)
+        return _json_response(404, {"message": "Not found"})
+
+    assets = [
+        (ImmichAsset(id="a-1", type="IMAGE"), ["general/1girl", "rating/safe"]),
+        (ImmichAsset(id="a-2", type="IMAGE"), ["general/1boy", "rating/general"]),
+        (ImmichAsset(id="a-3", type="IMAGE"), ["general/1girl", "rating/safe"]),
+    ]
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        client.sync_batch_tags(assets)
+
+    bulk_calls = [e for e in events if e[1] == "/api/tags/assets"]
+    assert len(bulk_calls) == 2
+    assert events[-1] == (
+        "PUT",
+        "/api/tags/id-meta/booru_tagged/assets",
+        {"ids": ["a-1", "a-2", "a-3"]},
+    )
+
+
+def test_sync_batch_tags_fast_fails_without_marking_processed_when_bulk_tag_fails() -> None:
+    from immich_booru_tagger.immich import ImmichAsset
+
+    marker_called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal marker_called
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            assert isinstance(body, dict)
+            return _json_response(
+                200,
+                [{"id": f"id-{tag}", "value": tag} for tag in body["tags"]],
+            )
+        if request.method == "PUT" and request.url.path == "/api/tags/assets":
+            assert isinstance(body, dict)
+            if "a-2" in body["assetIds"]:
+                return _json_response(500, {"message": "Bulk tag failure"})
+            return httpx.Response(status_code=204)
+        if request.method == "PUT" and request.url.path.endswith("/assets"):
+            marker_called = True
+            return httpx.Response(status_code=204)
+        return _json_response(404, {"message": "Not found"})
+
+    assets = [
+        (ImmichAsset(id="a-1", type="IMAGE"), ["general/1girl"]),
+        (ImmichAsset(id="a-2", type="IMAGE"), ["general/1boy"]),
+    ]
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(ImmichApiError, match="500"):
+            client.sync_batch_tags(assets)
+
+    assert marker_called is False

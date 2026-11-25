@@ -292,9 +292,9 @@ mode = "anime"
     assert "[dry-run]" not in out
     assert write_events == [
         ("DELETE", "/api/tags/old-m/assets", {"ids": ["a-1"]}),
-        ("PUT", "/api/tags", {"tags": ["meta/absurdres", "meta/booru_tagged"]}),
-        ("PUT", "/api/tags/new-0/assets", {"ids": ["a-1"]}),
-        ("PUT", "/api/tags/new-1/assets", {"ids": ["a-1"]}),
+        ("PUT", "/api/tags", {"tags": ["meta/absurdres"]}),
+        ("PUT", "/api/tags/assets", {"assetIds": ["a-1"], "tagIds": ["new-0"]}),
+        ("PUT", "/api/tags/old-m/assets", {"ids": ["a-1"]}),
     ]
 
 
