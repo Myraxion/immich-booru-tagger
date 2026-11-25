@@ -30,6 +30,7 @@ class ImmichConfig(BaseModel):
     api_key: str
     thumbnail_size: ThumbnailSize = "preview"
     timeout: float = Field(default=30.0, gt=0.0)
+    max_concurrency: int = Field(default=8, ge=1)
 
     @field_validator("base_url")
     @classmethod

@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import logging
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -104,7 +104,10 @@ class BatchRunner:
 
         results: list[AssetTagResult] = []
         skipped_count = 0
-        with self._prefetch_thumbnails(selected, batch_size=batch_size) as prefetched:
+        with (
+            self._prefetch_thumbnails(selected, batch_size=batch_size) as prefetched,
+            self._batch_writer(dry_run=dry_run, force=force) as submit_batch,
+        ):
             batch_index = 0
             batch_updates: list[tuple[ImmichAsset, list[str]]] = []
             log_prefix = "[dry-run] " if dry_run else ""
@@ -152,8 +155,7 @@ class BatchRunner:
 
                 is_batch_end = (idx + 1) % batch_size == 0 or idx + 1 == len(selected)
                 if is_batch_end and batch_updates:
-                    if not dry_run:
-                        self._client.sync_batch_tags(batch_updates, force=force)
+                    submit_batch(batch_updates)
                     batch_updates = []
 
         return RunSummary(
@@ -166,6 +168,43 @@ class BatchRunner:
             results=results,
             skipped_count=skipped_count,
         )
+
+    @contextmanager
+    def _batch_writer(
+        self,
+        *,
+        dry_run: bool,
+        force: bool,
+        max_in_flight: int = 2,
+    ) -> Iterator[Callable[[list[tuple[ImmichAsset, list[str]]]], None]]:
+        if dry_run:
+            yield lambda _batch: None
+            return
+
+        in_flight: deque[Future[None]] = deque()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            def _submit(batch_updates: list[tuple[ImmichAsset, list[str]]]) -> None:
+                while in_flight and in_flight[0].done():
+                    in_flight.popleft().result()
+                while len(in_flight) >= max_in_flight:
+                    in_flight.popleft().result()
+                in_flight.append(
+                    executor.submit(
+                        self._client.sync_batch_tags,
+                        batch_updates,
+                        force=force,
+                    )
+                )
+
+            try:
+                yield _submit
+            except BaseException:
+                for future in in_flight:
+                    future.cancel()
+                raise
+
+            while in_flight:
+                in_flight.popleft().result()
 
     @contextmanager
     def _prefetch_thumbnails(

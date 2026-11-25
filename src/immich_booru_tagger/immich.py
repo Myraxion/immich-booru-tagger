@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import threading
 from types import TracebackType
 from typing import Any, TypeVar
 
@@ -175,6 +176,9 @@ class ImmichClient:
         self._owns_client = client is None
         self._max_concurrency = max(1, max_concurrency)
         self._tag_cache: dict[str, str] = {}
+        self._tag_cache_prewarmed = False
+        self._tag_cache_lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
         pool_size = max(16, self._max_concurrency * 2)
         self._client = (
             client
@@ -203,6 +207,7 @@ class ImmichClient:
             base_url=config.immich.base_url,
             api_key=config.immich.api_key,
             timeout=config.immich.timeout,
+            max_concurrency=config.immich.max_concurrency,
             transport=transport,
         )
 
@@ -218,7 +223,10 @@ class ImmichClient:
         self.close()
 
     def close(self) -> None:
-        """Close the underlying httpx.Client if owned by this instance."""
+        """Close the underlying httpx.Client and shared executor if owned by this instance."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         if self._owns_client:
             self._client.close()
 
@@ -446,26 +454,46 @@ class ImmichClient:
         )
         return response.content
 
+    def _prewarm_tag_cache(self) -> None:
+        if self._tag_cache_prewarmed:
+            return
+        try:
+            payload = self._request_json("GET", "/api/tags")
+        except ImmichApiError as exc:
+            if exc.status_code in (401, 403):
+                raise
+            self._tag_cache_prewarmed = True
+            return
+
+        if isinstance(payload, list):
+            for item in payload:
+                parsed = ImmichTag.model_validate(item)
+                if parsed.id and parsed.value:
+                    self._tag_cache.setdefault(parsed.value, parsed.id)
+        self._tag_cache_prewarmed = True
+
     def ensure_tags(self, tag_values: Sequence[str]) -> dict[str, str]:
         """Upsert any unknown tags in Immich and return value -> id mapping."""
         unique_values = list(dict.fromkeys(tag_values))
-        unknown = [value for value in unique_values if value not in self._tag_cache]
-        if unknown:
-            payload = self._request_json("PUT", "/api/tags", json={"tags": unknown})
-            if not isinstance(payload, list):
-                raise ImmichApiError("Expected JSON list from PUT /api/tags")
-            for item in payload:
-                parsed = ImmichTag.model_validate(item)
-                if parsed.id:
-                    self._tag_cache[parsed.value] = parsed.id
+        with self._tag_cache_lock:
+            self._prewarm_tag_cache()
+            unknown = [value for value in unique_values if value not in self._tag_cache]
+            if unknown:
+                payload = self._request_json("PUT", "/api/tags", json={"tags": unknown})
+                if not isinstance(payload, list):
+                    raise ImmichApiError("Expected JSON list from PUT /api/tags")
+                for item in payload:
+                    parsed = ImmichTag.model_validate(item)
+                    if parsed.id:
+                        self._tag_cache[parsed.value] = parsed.id
 
-            missing = [value for value in unknown if value not in self._tag_cache]
-            if missing:
-                raise ImmichApiError(
-                    f"PUT /api/tags did not return tag IDs for: {', '.join(missing)}"
-                )
+                missing = [value for value in unknown if value not in self._tag_cache]
+                if missing:
+                    raise ImmichApiError(
+                        f"PUT /api/tags did not return tag IDs for: {', '.join(missing)}"
+                    )
 
-        return {value: self._tag_cache[value] for value in unique_values}
+            return {value: self._tag_cache[value] for value in unique_values}
 
     def tag_assets(self, tag_id: str, asset_ids: Sequence[str]) -> None:
         """Attach an existing tag ID to the given asset IDs."""
@@ -524,21 +552,19 @@ class ImmichClient:
 
         tags_to_ensure = [*unique_tags, PROCESSED_MARKER]
         tag_id_map = self.ensure_tags(tags_to_ensure)
+        marker_id = tag_id_map[PROCESSED_MARKER]
 
         assets_by_tag_set: dict[tuple[str, ...], list[str]] = {}
         for asset_id in all_asset_ids:
             tag_ids = tuple(
-                sorted(tag_id_map[value] for value in asset_tag_values[asset_id])
+                sorted({*(tag_id_map[value] for value in asset_tag_values[asset_id]), marker_id})
             )
-            if tag_ids:
-                _append_unique(assets_by_tag_set, tag_ids, asset_id)
+            _append_unique(assets_by_tag_set, tag_ids, asset_id)
 
         self._map_concurrently(
             lambda pair: self.bulk_tag_assets(pair[1], pair[0]),
             list(assets_by_tag_set.items()),
         )
-
-        self.tag_assets(tag_id_map[PROCESSED_MARKER], all_asset_ids)
 
     def _unbind_managed_tags(self, assets: Sequence[ImmichAsset]) -> None:
         managed_pairs: list[tuple[ImmichTag, str]] = [
@@ -567,10 +593,9 @@ class ImmichClient:
         self, fn: Callable[[_ItemT], _ResultT], items: Sequence[_ItemT]
     ) -> list[_ResultT]:
         if len(items) > 1 and self._max_concurrency > 1:
-            with ThreadPoolExecutor(
-                max_workers=min(self._max_concurrency, len(items))
-            ) as executor:
-                return list(executor.map(fn, items))
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=self._max_concurrency)
+            return list(self._executor.map(fn, items))
         return [fn(item) for item in items]
 
     def _list_albums(self) -> list[_AlbumSummaryPayload]:

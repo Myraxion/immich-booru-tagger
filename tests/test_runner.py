@@ -296,19 +296,14 @@ def test_batch_runner_writes_back_per_micro_batch_reusing_tag_cache() -> None:
         (method, path, tuple(body["assetIds"]), frozenset(body["tagIds"]))  # type: ignore[index]
         for method, path, body in batch1_bulk
     } == {
-        ("PUT", "/api/tags/assets", ("img-1",), frozenset({id_1girl, id_absurdres})),
-        ("PUT", "/api/tags/assets", ("img-2",), frozenset({id_1girl, id_lowres, id_tall})),
+        ("PUT", "/api/tags/assets", ("img-1",), frozenset({id_1girl, id_absurdres, "t-1"})),
+        ("PUT", "/api/tags/assets", ("img-2",), frozenset({id_1girl, id_lowres, id_tall, "t-1"})),
     }
-    assert write_events[3] == (
-        "PUT",
-        "/api/tags/t-1/assets",
-        {"ids": ["img-1", "img-2"]},
-    )
-    assert write_events[4] == ("PUT", "/api/tags", {"tags": ["rating/safe"]})
-    assert write_events[5][0:2] == ("PUT", "/api/tags/assets")
-    assert write_events[5][2]["assetIds"] == ["img-3"]  # type: ignore[index]
-    assert set(write_events[5][2]["tagIds"]) == {id_1girl, id_safe}  # type: ignore[index]
-    assert write_events[6] == ("PUT", "/api/tags/t-1/assets", {"ids": ["img-3"]})
+    assert write_events[3] == ("PUT", "/api/tags", {"tags": ["rating/safe"]})
+    assert write_events[4][0:2] == ("PUT", "/api/tags/assets")
+    assert write_events[4][2]["assetIds"] == ["img-3"]  # type: ignore[index]
+    assert set(write_events[4][2]["tagIds"]) == {id_1girl, id_safe, "t-1"}  # type: ignore[index]
+    assert len(write_events) == 5
 
 
 def test_batch_runner_force_mode_unbinds_only_managed_old_tags_and_preserves_personal_tags() -> None:
@@ -417,11 +412,10 @@ def test_batch_runner_force_mode_unbinds_only_managed_old_tags_and_preserves_per
         i for i, e in enumerate(events) if e[0] == "PUT" and e[1].endswith("/assets")
     )
     assert last_delete_idx < first_attach_idx
-    assert put_calls[-1] == (
-        "PUT",
-        "/api/tags/old-marker/assets",
-        {"ids": ["a-1", "a-2"]},
-    )
+    bulk_puts = [e for e in put_calls if e[1] == "/api/tags/assets"]
+    assert bulk_puts
+    assert all("old-marker" in call[2]["tagIds"] for call in bulk_puts)  # type: ignore[index]
+    assert not any(e[1] == "/api/tags/old-marker/assets" for e in put_calls)
 
 
 def test_batch_runner_fast_fails_when_micro_batch_write_back_fails() -> None:
@@ -448,8 +442,9 @@ def test_batch_runner_fast_fails_when_micro_batch_write_back_fails() -> None:
             runner.run(dry_run=False)
 
     assert exc_info.value.status_code == 500
-    # Batch 1 aborted at first asset-binding call; batch 2 never ran
-    assert len(write_requests) == 2
+    # Batch 1 failed during asset-binding; batch 2 never ran
+    assert write_requests.count(("PUT", "/api/tags")) == 1
+    assert any(method == "PUT" and path == "/api/tags/assets" for method, path in write_requests)
 
 
 def test_batch_runner_fetches_configured_thumbnail_size_decodes_in_memory_and_closes_image() -> None:
@@ -599,11 +594,10 @@ def test_batch_runner_skips_missing_or_corrupt_thumbnails_with_warning_and_write
     assert any("img-404" in msg and "missing_thumb.png" in msg for msg in warning_messages)
     assert any("img-corrupt" in msg and "corrupt_bytes.png" in msg for msg in warning_messages)
 
-    # Only img-ok receives tags and meta/booru_tagged
+    # Only img-ok receives tags and meta/booru_tagged in a single bulk write
     assert write_events == [
         ("PUT", "/api/tags", {"tags": ["general/1girl", "meta/absurdres", "meta/booru_tagged"]}),
-        ("PUT", "/api/tags/assets", {"assetIds": ["img-ok"], "tagIds": ["t-0", "t-1"]}),
-        ("PUT", "/api/tags/t-2/assets", {"ids": ["img-ok"]}),
+        ("PUT", "/api/tags/assets", {"assetIds": ["img-ok"], "tagIds": ["t-0", "t-1", "t-2"]}),
     ]
 
 
@@ -835,11 +829,10 @@ def test_anime_album_end_to_end_with_default_vision_pipeline_and_truncated_image
     assert "a-truncated" not in by_id
 
     marker_id = tag_ids["meta/booru_tagged"]
-    assert write_events[-1] == (
-        "PUT",
-        f"/api/tags/{marker_id}/assets",
-        {"ids": ["a-illu", "a-not-painting"]},
-    )
+    bulk_puts = [e for e in write_events if e[0:2] == ("PUT", "/api/tags/assets")]
+    assert len(bulk_puts) == 2
+    assert all(marker_id in call[2]["tagIds"] for call in bulk_puts)  # type: ignore[index]
+    assert not any(e[1] == f"/api/tags/{marker_id}/assets" for e in write_events)
 
 
 def test_mixed_albums_auto_anime_real_routing_end_to_end() -> None:
@@ -1044,11 +1037,10 @@ def test_mixed_albums_auto_anime_real_routing_end_to_end() -> None:
     ]
 
     marker_id = tag_ids["meta/booru_tagged"]
-    assert write_events[-1] == (
-        "PUT",
-        f"/api/tags/{marker_id}/assets",
-        {"ids": ["auto-anime", "auto-real", "forced-anime", "forced-real"]},
-    )
+    bulk_puts = [e for e in write_events if e[0:2] == ("PUT", "/api/tags/assets")]
+    assert len(bulk_puts) == 4
+    assert all(marker_id in call[2]["tagIds"] for call in bulk_puts)  # type: ignore[index]
+    assert not any(e[1] == f"/api/tags/{marker_id}/assets" for e in write_events)
 
 
 def test_auto_album_with_only_real_images_never_loads_anime_backend() -> None:
@@ -1396,3 +1388,70 @@ def test_batch_runner_closes_prefetched_images_on_fast_fail(
             ).run(dry_run=True)
 
     assert set(closed_ids) == {"1x1", "2x2"}
+
+
+def test_batch_runner_overlaps_batch_write_back_with_next_batch_inference() -> None:
+    import threading
+
+    second_inference_started = threading.Event()
+    write_released = False
+
+    class OverlapVisionPipeline:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict(
+            self, image: Image.Image, mode: RoutingMode
+        ) -> Sequence[tuple[str, str]]:
+            self.calls += 1
+            if self.calls == 2:
+                second_inference_started.set()
+            return [("general", f"tag_{self.calls}")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal write_released
+        if request.method == "GET" and request.url.path == "/api/albums/alb-async":
+            return _json_response(
+                200,
+                {
+                    "id": "alb-async",
+                    "albumName": "Async",
+                    "assets": [
+                        {"id": "a-1", "type": "IMAGE", "originalFileName": "1.png", "tags": []},
+                        {"id": "a-2", "type": "IMAGE", "originalFileName": "2.png", "tags": []},
+                    ],
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/thumbnail"):
+            return httpx.Response(200, content=_png_bytes())
+        if request.method == "GET" and request.url.path == "/api/tags":
+            return _json_response(200, [])
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            return _json_response(
+                200, [{"id": f"tid-{v}", "value": v} for v in body["tags"]]
+            )
+        if request.method == "PUT" and request.url.path == "/api/tags/assets":
+            body = json.loads(request.content.decode("utf-8"))
+            if "a-1" in body["assetIds"]:
+                write_released = second_inference_started.wait(timeout=2.0)
+                assert write_released, "Batch 2 inference did not start while batch 1 write was in flight"
+            return httpx.Response(status_code=204)
+        return _json_response(404, {})
+
+    config = AppConfig(
+        immich=ImmichConfig(base_url="http://immich.local:2283", api_key="secret"),
+        batch=BatchConfig(size=1),
+        albums=[AlbumConfig(id="alb-async", mode="anime")],
+    )
+
+    with ImmichClient.from_config(config, transport=httpx.MockTransport(handler)) as client:
+        summary = BatchRunner(
+            config=config,
+            client=client,
+            vision_pipeline=OverlapVisionPipeline(),
+        ).run(dry_run=False)
+
+    assert summary.processed_count == 2
+    assert summary.batches_count == 2
+    assert write_released is True

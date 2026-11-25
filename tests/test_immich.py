@@ -694,11 +694,13 @@ def test_sync_batch_tags_uses_bulk_endpoint_concurrently_and_marks_processed_las
 
     bulk_calls = [e for e in events if e[1] == "/api/tags/assets"]
     assert len(bulk_calls) == 2
-    assert events[-1] == (
-        "PUT",
-        "/api/tags/id-meta/booru_tagged/assets",
-        {"ids": ["a-1", "a-2", "a-3"]},
+    assert all(
+        "id-meta/booru_tagged" in call[2]["tagIds"]  # type: ignore[index]
+        for call in bulk_calls
     )
+    assert [
+        e for e in events if e[0] == "PUT" and e[1] == "/api/tags/id-meta/booru_tagged/assets"
+    ] == []
 
 
 def test_sync_batch_tags_fast_fails_without_marking_processed_when_bulk_tag_fails() -> None:
@@ -803,3 +805,66 @@ def test_resolve_target_albums_stops_early_when_max_eligible_reached() -> None:
     assert "GET /api/assets/a-3" not in seen_paths
     assert "GET /api/albums/album-2" not in seen_paths
     assert seen_paths.count("POST /api/search/metadata") == 1
+
+
+def test_ensure_tags_prewarms_cache_from_get_tags_and_only_upserts_new_tags() -> None:
+    get_tags_calls = 0
+    upsert_calls: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_tags_calls
+        if request.method == "GET" and request.url.path == "/api/tags":
+            get_tags_calls += 1
+            return _json_response(
+                200,
+                [
+                    {"id": "existing-1", "value": "general/1girl"},
+                    {"id": "existing-2", "name": "meta/booru_tagged"},
+                ],
+            )
+        if request.method == "PUT" and request.url.path == "/api/tags":
+            body = json.loads(request.content.decode("utf-8"))
+            tags = body["tags"]
+            upsert_calls.append(tags)
+            return _json_response(
+                200,
+                [{"id": f"new-{i}", "value": tag} for i, tag in enumerate(tags)],
+            )
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        first = client.ensure_tags(["general/1girl", "meta/booru_tagged", "rating/safe"])
+        second = client.ensure_tags(["general/1girl", "rating/safe"])
+
+    assert get_tags_calls == 1
+    assert upsert_calls == [["rating/safe"]]
+    assert first == {
+        "general/1girl": "existing-1",
+        "meta/booru_tagged": "existing-2",
+        "rating/safe": "new-0",
+    }
+    assert second == {
+        "general/1girl": "existing-1",
+        "rating/safe": "new-0",
+    }
+
+
+def test_ensure_tags_propagates_auth_error_on_tag_cache_prewarm() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/tags":
+            return _json_response(401, {"message": "Unauthorized"})
+        return _json_response(404, {"message": "Not found"})
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="bad",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(ImmichApiError) as exc_info:
+            client.ensure_tags(["general/1girl"])
+
+    assert exc_info.value.status_code == 401

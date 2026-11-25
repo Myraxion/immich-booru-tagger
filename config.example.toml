@@ -10,6 +10,8 @@ api_key = "your-immich-api-key"
 thumbnail_size = "preview"
 # 单次 HTTP 请求超时时间（秒）
 timeout = 30.0
+# Immich API 并发请求数上限（如标签批量写回、资产补全）
+max_concurrency = 8
 
 [batch]
 # 微批次（Micro-batch）大小：每处理满该数量资产立即向 Immich 批量写回一次标签

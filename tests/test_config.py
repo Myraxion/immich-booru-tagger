@@ -27,6 +27,7 @@ name = "Anime Art"
     assert config.immich.api_key == "secret-key"
     assert config.immich.thumbnail_size == "preview"
     assert config.immich.timeout == 30.0
+    assert config.immich.max_concurrency == 8
     assert config.batch.size == 20
     assert config.pipeline.enable_domain_tag is True
     assert config.pipeline.enable_dimension_tags is True
@@ -52,6 +53,7 @@ base_url = "https://immich.example.com"
 api_key = "file-key"
 thumbnail_size = "thumbnail"
 timeout = 12.5
+max_concurrency = 16
 
 [batch]
 size = 10
@@ -79,6 +81,7 @@ mode = "anime"
 
     assert config.immich.thumbnail_size == "thumbnail"
     assert config.immich.timeout == 12.5
+    assert config.immich.max_concurrency == 16
     assert config.batch.size == 10
     assert config.pipeline.anime.general_threshold == 0.4
     assert config.pipeline.anime.character_threshold == 0.9
