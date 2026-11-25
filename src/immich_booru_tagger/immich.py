@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import threading
+import time
 from types import TracebackType
 from typing import Any, TypeVar
 
@@ -190,6 +191,7 @@ class ImmichClient:
                 limits=httpx.Limits(
                     max_connections=pool_size,
                     max_keepalive_connections=pool_size,
+                    keepalive_expiry=2.0,
                 ),
                 transport=transport,
             )
@@ -635,10 +637,22 @@ class ImmichClient:
         json: Any = None,
         params: Mapping[str, str] | None = None,
     ) -> httpx.Response:
-        try:
-            response = self._client.request(method, path, json=json, params=params)
-        except httpx.HTTPError as exc:
-            raise ImmichApiError(f"Immich request {method} {path} failed: {exc}") from exc
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._client.request(method, path, json=json, params=params)
+                break
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+                if attempt < max_retries:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise ImmichApiError(
+                    f"Immich request {method} {path} failed: {exc}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise ImmichApiError(
+                    f"Immich request {method} {path} failed: {exc}"
+                ) from exc
 
         if response.is_error:
             raise ImmichApiError(

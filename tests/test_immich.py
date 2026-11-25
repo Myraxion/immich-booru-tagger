@@ -868,3 +868,50 @@ def test_ensure_tags_propagates_auth_error_on_tag_cache_prewarm() -> None:
             client.ensure_tags(["general/1girl"])
 
     assert exc_info.value.status_code == 401
+
+
+def test_send_request_retries_on_transient_disconnect_and_succeeds() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return _json_response(
+            200,
+            {
+                "id": "album-1",
+                "albumName": "Recovered",
+                "assets": [],
+            },
+        )
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        albums = client.resolve_target_albums([AlbumConfig(id="album-1")])
+
+    assert attempts == 2
+    assert albums[0].name == "Recovered"
+
+
+def test_send_request_raises_after_exhausting_disconnect_retries() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+
+    with ImmichClient(
+        base_url="http://immich.local:2283",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(ImmichApiError, match="Server disconnected"):
+            client.resolve_target_albums([AlbumConfig(id="album-1")])
+
+    assert attempts == 3
